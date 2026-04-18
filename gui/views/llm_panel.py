@@ -141,7 +141,9 @@ def _parse_llm_response(raw: str, provider: str) -> LLMAnalysisResult:
         risk = "low"
 
     import re as _re
-    # Match numbered items either on separate lines or inline (e.g. "1. foo. 2. bar.")
+    # Match numbered list items.  Pattern captures the text after "N. " up to a
+    # sentence boundary, supporting both single-line ("1. foo. 2. bar.") and
+    # multi-line ("\n1. foo\n2. bar") LLM output formats.
     recs = _re.findall(r"\d+\.\s+([^.]+(?:\.[^.0-9][^.]*)?)", raw)
     if not recs:
         # Fall back to bullet lines

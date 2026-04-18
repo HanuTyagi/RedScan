@@ -291,7 +291,7 @@ class DashboardView(ctk.CTkFrame):
         if ports_str:
             cmd.extend(["-p", ports_str])
 
-        cmd.extend(["-oX", "-"])   # stream XML to stdout
+        cmd.extend(["-oG", "-"])   # greppable output for real-time parsing (not XML)
         cmd.append(target)
         return cmd
 

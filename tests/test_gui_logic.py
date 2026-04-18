@@ -9,7 +9,8 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _gui_available() -> bool:
-    import os, sys  # noqa: E401
+    import os
+    import sys
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
         return False
     try:
@@ -41,6 +42,18 @@ class TestCommandFactoryConflicts:
         placed = {"-sS"}
         disabled = _check_hard_conflict(placed)
         assert "port_scope" not in disabled
+        assert not any("sT" in k for k in disabled)
+
+    def test_fragmentation_blocks_st(self) -> None:
+        placed = {"-f"}
+        disabled = _check_hard_conflict(placed)
+        # Should block the -sT flag specifically
+        assert any("sT" in k for k in disabled)
+
+    def test_st_blocks_fragmentation(self) -> None:
+        placed = {"-sT"}
+        disabled = _check_hard_conflict(placed)
+        assert any("f" in k for k in disabled)
 
     def test_empty_placed_no_conflict(self) -> None:
         disabled = _check_hard_conflict(set())

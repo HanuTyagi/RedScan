@@ -307,24 +307,35 @@ class SmartScanView(ctk.CTkFrame):
         loop = asyncio.new_event_loop()
 
         async def _run() -> None:
-            probe_count = 0
+            # Use the public discovery_pass to scan all endpoints, then stream
+            # per-result feedback by slicing into small batches.
+            batch_size = 20
             open_count = 0
-            for ep in endpoints:
-                result = await module._probe(ep)
-                probe_count += 1
-                rate = module.controller.rate
-                rtt_f = module.controller.filtered_rtt_ms
-
-                self.after(0, self._update_live, rate, rtt_f, open_count, probe_count)
-
-                if result.status == "open":
+            total = 0
+            for i in range(0, len(endpoints), batch_size):
+                if not self._running:
+                    break
+                batch = endpoints[i : i + batch_size]
+                output = await module.discovery_pass(batch)
+                total += output.stats.total_count
+                for ep in output.open_endpoints:
                     open_count += 1
-                    self.after(0, self._log_msg,
-                        f"[+] OPEN  {ep.host}:{ep.port}  rtt={result.rtt_ms:.1f}ms\n")
-                    self.after(0, self._card_open.configure, {"text": str(open_count)})
-
-                if probe_count % 10 == 0:
-                    module.controller.control_update()
+                    rtt_result = next(
+                        (r for r in output.all_results if r.endpoint == ep and r.rtt_ms), None
+                    )
+                    rtt_str = f"{rtt_result.rtt_ms:.1f}ms" if rtt_result and rtt_result.rtt_ms else "—"
+                    self.after(
+                        0, self._log_msg,
+                        f"[+] OPEN  {ep.host}:{ep.port}  rtt={rtt_str}\n",
+                    )
+                self.after(
+                    0, self._update_live,
+                    output.stats.final_rate,
+                    output.stats.calibration_rtt_filtered_ms,
+                    open_count,
+                    total,
+                )
+                self.after(0, self._card_open.configure, {"text": str(open_count)})
 
         try:
             loop.run_until_complete(_run())

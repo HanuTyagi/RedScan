@@ -81,12 +81,23 @@ _HARD_CONFLICTS: dict[str, set[str]] = {
 
 # Detect fragmentation (-f) conflicts with -sT
 def _check_hard_conflict(placed_tokens: set[str]) -> set[str]:
-    """Return the set of flag categories that must be disabled."""
+    """Return the set of flag categories that must be disabled.
+
+    Rules (from Nmap documentation):
+    - -sn (ping only) has no concept of port scope → disable port_scope.
+    - -f (fragmentation) is incompatible with -sT (connect scan uses OS
+      sockets, not raw packets) → disable scan_type if fragmentation is
+      already placed, and vice-versa.
+    """
     disabled: set[str] = set()
     if "-sn" in placed_tokens:
         disabled.add("port_scope")
-    if "-f" in placed_tokens and "-sT" in placed_tokens:
-        disabled.add("evasion")   # Already placed -f, but warn
+    # Fragmentation/-f requires raw sockets; -sT uses the OS connect() API.
+    # Block the opposite category so the user cannot create an invalid pair.
+    if "-f" in placed_tokens:
+        disabled.add("scan_type:sT")   # prevents adding -sT while -f is active
+    if "-sT" in placed_tokens:
+        disabled.add("evasion:f")      # prevents adding -f while -sT is active
     return disabled
 
 
@@ -257,7 +268,7 @@ class CommandFactoryView(ctk.CTkFrame):
 
         placed_tokens: set[str] = {f.first_token for f in self._placed}
         placed_cats: set[str] = {f.category for f in self._placed}
-        disabled_cats = _check_hard_conflict(placed_tokens)
+        hard_conflicts = _check_hard_conflict(placed_tokens)
 
         current_cat = ""
         for fd in self._flags_data:
@@ -270,8 +281,20 @@ class CommandFactoryView(ctk.CTkFrame):
             if fd.category in single_select_cats and fd.category in placed_cats:
                 continue
 
-            # Skip if category is hard-conflicted
-            if fd.category in disabled_cats:
+            # Skip if this specific flag is blocked by a hard conflict.
+            # Hard conflicts use the form "category:token" (e.g. "scan_type:sT")
+            # or plain "category" to block the whole category.
+            blocked = False
+            for conflict_key in hard_conflicts:
+                if ":" in conflict_key:
+                    _, flag_suffix = conflict_key.split(":", 1)
+                    if fd.first_token.lstrip("-") == flag_suffix:
+                        blocked = True
+                        break
+                elif fd.category == conflict_key:
+                    blocked = True
+                    break
+            if blocked:
                 continue
 
             # Category header
