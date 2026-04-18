@@ -72,32 +72,37 @@ _FLAG_DEFS: list[tuple[list[str], str, str, str]] = [
     (["--open"],         "--open",              "misc", "Show only open ports"),
 ]
 
-# Conflicts: if a flag with these categories is present, these other categories
-# must be removed from the palette.
+# Hard conflict table: placed flag key → set of flag/category keys to block.
 _HARD_CONFLICTS: dict[str, set[str]] = {
-    "scan_type:sn":  {"port_scope"},   # Ping-only has no port scope
-    "evasion:f":     {"scan_type:sT"}, # Fragmentation breaks connect scan
+    "scan_type:sn": {"port_scope"},    # -sn (ping-only) has no port scope
+    "evasion:f":    {"scan_type:sT"},  # -f (fragmentation) incompatible with -sT connect scan
+    "scan_type:sT": {"evasion:f"},     # -sT (connect scan) incompatible with -f fragmentation
 }
 
-# Detect fragmentation (-f) conflicts with -sT
 def _check_hard_conflict(placed_tokens: set[str]) -> set[str]:
-    """Return the set of flag categories that must be disabled.
+    """Return the set of flag/category keys that must be blocked.
+
+    Uses the _HARD_CONFLICTS table: keys are "category:token" selectors for
+    placed flags; values are sets of keys that must be blocked while that flag
+    is active.
 
     Rules (from Nmap documentation):
     - -sn (ping only) has no concept of port scope → disable port_scope.
     - -f (fragmentation) is incompatible with -sT (connect scan uses OS
-      sockets, not raw packets) → disable scan_type if fragmentation is
-      already placed, and vice-versa.
+      sockets, not raw packets) → disable scan_type:sT when -f is placed and
+      vice-versa.
     """
+    # Map token → conflict-key for lookup
+    _TOKEN_TO_KEY = {
+        "-sn": "scan_type:sn",
+        "-f":  "evasion:f",
+        "-sT": "scan_type:sT",
+    }
     disabled: set[str] = set()
-    if "-sn" in placed_tokens:
-        disabled.add("port_scope")
-    # Fragmentation/-f requires raw sockets; -sT uses the OS connect() API.
-    # Block the opposite category so the user cannot create an invalid pair.
-    if "-f" in placed_tokens:
-        disabled.add("scan_type:sT")   # prevents adding -sT while -f is active
-    if "-sT" in placed_tokens:
-        disabled.add("evasion:f")      # prevents adding -f while -sT is active
+    for token in placed_tokens:
+        conflict_key = _TOKEN_TO_KEY.get(token)
+        if conflict_key and conflict_key in _HARD_CONFLICTS:
+            disabled |= _HARD_CONFLICTS[conflict_key]
     return disabled
 
 
