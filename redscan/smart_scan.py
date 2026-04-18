@@ -72,6 +72,8 @@ class AdaptiveRateController:
 
 
 class SmartScanModule:
+    _RATE_TO_CONCURRENCY_DIVISOR = 10
+
     def __init__(self, cfg: DiscoveryConfig | None = None) -> None:
         self.cfg = cfg or DiscoveryConfig()
         self.controller = AdaptiveRateController(self.cfg)
@@ -115,7 +117,7 @@ class SmartScanModule:
         last_control = time.monotonic()
 
         while queue or in_flight:
-            while queue and len(in_flight) < max(1, int(self.controller.rate // 10)):
+            while queue and len(in_flight) < max(1, int(self.controller.rate // self._RATE_TO_CONCURRENCY_DIVISOR)):
                 endpoint = queue.popleft()
                 in_flight[asyncio.create_task(self._probe(endpoint))] = False
                 calibration_counter += 1

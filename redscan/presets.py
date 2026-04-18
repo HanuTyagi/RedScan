@@ -48,7 +48,11 @@ class PresetManager:
 
         timings = [f for f in combined if f.startswith("-T")]
         if len(timings) > 1:
-            highest = max(timings, key=lambda t: int(t.replace("-T", "") or 0))
+            def _timing_level(flag: str) -> int:
+                suffix = flag[2:]
+                return int(suffix) if suffix.isdigit() else 0
+
+            highest = max(timings, key=_timing_level)
             combined = [f for f in combined if not f.startswith("-T")] + [highest]
 
         return preset.model_copy(update={"flags": combined})
