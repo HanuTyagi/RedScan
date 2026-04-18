@@ -94,7 +94,7 @@ class LLMAnalysisResult(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    target_hosts: list[str]
+    target_hosts: list[str] = Field(min_length=1)
     ports: list[int] = Field(default_factory=lambda: [22, 80, 443])
     calibration_endpoint: Endpoint = Field(default_factory=lambda: Endpoint(host="127.0.0.1", port=22))
     preset_key: str = "safe_discovery"

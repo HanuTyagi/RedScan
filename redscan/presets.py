@@ -6,6 +6,8 @@ from .models import PresetScanConfig
 
 
 def _timing_level(flag: str) -> int:
+    if not flag.startswith("-T") or len(flag) <= 2:
+        return 0
     suffix = flag[2:]
     return int(suffix) if suffix.isdigit() else 0
 
