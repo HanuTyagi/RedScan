@@ -6,7 +6,7 @@ from redscan.models import DiscoveryConfig, Endpoint
 from redscan.smart_scan import SmartScanModule
 
 
-async def start_test_server() -> tuple[asyncio.base_events.Server, int]:
+async def _start_test_server() -> tuple[asyncio.base_events.Server, int]:
     server = await asyncio.start_server(lambda r, w: w.close(), host="127.0.0.1", port=0)
     port = server.sockets[0].getsockname()[1]
     return server, port
@@ -14,7 +14,7 @@ async def start_test_server() -> tuple[asyncio.base_events.Server, int]:
 
 @pytest.mark.asyncio
 async def test_smart_scan_discovers_open_port_and_handoff() -> None:
-    server, open_port = await start_test_server()
+    server, open_port = await _start_test_server()
     try:
         cfg = DiscoveryConfig(
             calibration_host="127.0.0.1",

@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from .models import PresetScanConfig
 
 
-def _timing_level(flag: str) -> int:
+def _extract_timing_level(flag: str) -> int:
     if not flag.startswith("-T") or len(flag) <= 2:
         return 0
     suffix = flag[2:]
@@ -53,9 +53,9 @@ class PresetManager:
         if "-sn" in combined and any(flag.startswith("-p") for flag in combined):
             combined = [f for f in combined if f != "-sn"]
 
-        valid_timings = [f for f in combined if _timing_level(f) > 0]
+        valid_timings = [f for f in combined if _extract_timing_level(f) > 0]
         if valid_timings:
-            combined = [f for f in combined if not (f.startswith("-T") and _timing_level(f) > 0)]
-            combined.append(max(valid_timings, key=_timing_level))
+            combined = [f for f in combined if not (f.startswith("-T") and _extract_timing_level(f) > 0)]
+            combined.append(max(valid_timings, key=_extract_timing_level))
 
         return preset.model_copy(update={"flags": combined})

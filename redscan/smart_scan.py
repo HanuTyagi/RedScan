@@ -73,7 +73,7 @@ class AdaptiveRateController:
 
 class SmartScanModule:
     # Convert rate units into an upper bound for concurrent in-flight probes.
-    _RATE_TO_CONCURRENCY_DIVISOR = 10
+    _CONCURRENCY_SCALING_FACTOR = 10
 
     def __init__(self, cfg: DiscoveryConfig | None = None) -> None:
         self.cfg = cfg or DiscoveryConfig()
@@ -118,7 +118,7 @@ class SmartScanModule:
         last_control = time.monotonic()
 
         while queue or in_flight:
-            while queue and len(in_flight) < max(1, int(self.controller.rate // self._RATE_TO_CONCURRENCY_DIVISOR)):
+            while queue and len(in_flight) < max(1, int(self.controller.rate // self._CONCURRENCY_SCALING_FACTOR)):
                 endpoint = queue.popleft()
                 in_flight[asyncio.create_task(self._probe(endpoint))] = False
                 calibration_counter += 1
