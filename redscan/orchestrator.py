@@ -34,19 +34,19 @@ class RedScanOrchestrator:
         handoff = await self.smart_scan.deep_enumeration_handoff(discovery)
 
         preset = self.presets.resolve_conflicts(self.presets.get(request.preset_key))
-        first_target = request.target_hosts[0]
+        enumeration_target = request.target_hosts[0]
         command = self.factory.build(
             CommandBuildRequest(
-                target=first_target,
+                target=enumeration_target,
                 preset=preset,
-                ports=handoff.get(first_target, []),
+                ports=handoff.get(enumeration_target, []),
                 timing="-T4",
             )
         )
 
         analysis = await self.llm.run(
             LLMAnalysisRequest(
-                target=first_target,
+                target=enumeration_target,
                 open_endpoints=discovery.open_endpoints,
                 runtime_findings=[],
             )

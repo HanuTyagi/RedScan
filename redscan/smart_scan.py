@@ -72,6 +72,7 @@ class AdaptiveRateController:
 
 
 class SmartScanModule:
+    # Convert rate units into an upper bound for concurrent in-flight probes.
     _RATE_TO_CONCURRENCY_DIVISOR = 10
 
     def __init__(self, cfg: DiscoveryConfig | None = None) -> None:
