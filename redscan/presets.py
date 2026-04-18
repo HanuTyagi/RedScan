@@ -5,6 +5,11 @@ from pydantic import BaseModel, Field
 from .models import PresetScanConfig
 
 
+def _timing_level(flag: str) -> int:
+    suffix = flag[2:]
+    return int(suffix) if suffix.isdigit() else 0
+
+
 class PresetCollection(BaseModel):
     presets: dict[str, PresetScanConfig] = Field(default_factory=dict)
 
@@ -48,10 +53,6 @@ class PresetManager:
 
         timings = [f for f in combined if f.startswith("-T")]
         if len(timings) > 1:
-            def _timing_level(flag: str) -> int:
-                suffix = flag[2:]
-                return int(suffix) if suffix.isdigit() else 0
-
             highest = max(timings, key=_timing_level)
             combined = [f for f in combined if not f.startswith("-T")] + [highest]
 

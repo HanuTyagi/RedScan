@@ -28,8 +28,8 @@ async def test_smart_scan_discovers_open_port_and_handoff() -> None:
             loss_threshold=2,
         )
         module = SmartScanModule(cfg)
-        endpoints = [Endpoint(host="127.0.0.1", port=open_port), Endpoint(host="127.0.0.1", port=open_port + 1)]
-        out = await module.discovery_pass(endpoints)
+        test_endpoints = [Endpoint(host="127.0.0.1", port=open_port), Endpoint(host="127.0.0.1", port=open_port + 1)]
+        out = await module.discovery_pass(test_endpoints)
         assert any(ep.port == open_port for ep in out.open_endpoints)
         handoff = await module.deep_enumeration_handoff(out)
         assert open_port in handoff.get("127.0.0.1", [])

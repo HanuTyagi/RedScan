@@ -28,8 +28,8 @@ def test_runtime_parser_incremental_open_port_event() -> None:
 
 def test_api_scan_happy_path() -> None:
     client = TestClient(app)
-    server = client.get("/health")
-    assert server.status_code == 200
+    health_response = client.get("/health")
+    assert health_response.status_code == 200
 
     resp = client.post(
         "/scan",
