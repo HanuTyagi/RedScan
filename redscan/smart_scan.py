@@ -142,7 +142,9 @@ class SmartScanModule:
                         self.controller.calibration_update(result.rtt_ms)
                     else:
                         results.append(result)
-                in_flight = {task: in_flight[task] for task in pending}
+                pending_map = {task: in_flight[task] for task in pending}
+                in_flight.clear()
+                in_flight.update(pending_map)
 
             now = time.monotonic()
             if now - last_control >= self.cfg.control_interval_s:

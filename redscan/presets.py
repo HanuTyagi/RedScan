@@ -54,13 +54,8 @@ class PresetManager:
             combined = [f for f in combined if f != "-sn"]
 
         valid_timings = [f for f in combined if _timing_level(f) > 0]
-        if len(valid_timings) > 1:
+        if valid_timings:
             combined = [f for f in combined if not (f.startswith("-T") and _timing_level(f) > 0)]
-            highest = max(valid_timings, key=_timing_level)
-            combined.append(highest)
-        elif len(valid_timings) == 1:
-            highest = valid_timings[0]
-            combined = [f for f in combined if not (f.startswith("-T") and _timing_level(f) > 0)]
-            combined.append(highest)
+            combined.append(max(valid_timings, key=_timing_level))
 
         return preset.model_copy(update={"flags": combined})
