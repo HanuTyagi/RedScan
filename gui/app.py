@@ -189,15 +189,17 @@ class RedScanApp(ctk.CTk):
         self._show_view("llm")
 
     def _on_smart_scan_results(self, results: list[dict[str, Any]], rate: float) -> None:
-        """Smart Scan: forward discovered hosts to the Dashboard."""
-        self._show_view("dashboard")
-        # Display a brief summary
-        _info_dialog(
-            self,
-            "Smart Scan Complete",
-            f"{len(results)} open endpoints discovered at final rate {rate:.0f} probes/s.\n"
-            "Results forwarded to the Dashboard.",
-        )
+        """Smart Scan: populate the Dashboard with discovered endpoints and navigate to it."""
+        if results:
+            self._dashboard.load_from_smart_scan(results, rate)
+            self._show_view("dashboard")
+        else:
+            _info_dialog(
+                self,
+                "Smart Scan Complete",
+                "No open endpoints were discovered.\n"
+                "Try expanding the port range or target CIDR.",
+            )
 
 
 # ---------------------------------------------------------------------------

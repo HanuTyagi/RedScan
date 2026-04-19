@@ -288,7 +288,10 @@ class DashboardView(ctk.CTkFrame):
         else:
             cmd.extend(["-sT", "-sV", "-T4"])
 
-        if ports_str:
+        # Conflict rule: -sn (host-discovery-only) has no port-scan phase.
+        # Silently drop the port specification; _log_preflight_warnings() will
+        # tell the user what happened.
+        if ports_str and "-sn" not in cmd:
             cmd.extend(["-p", ports_str])
 
         # Use default nmap text output (not greppable -oG).
@@ -298,6 +301,59 @@ class DashboardView(ctk.CTkFrame):
         # and those regexes would never match, leaving the dashboard empty.
         cmd.append(target)
         return cmd
+
+    def _log_preflight_warnings(self, cmd: list[str]) -> None:
+        """Detect known Nmap flag conflicts and log advisory messages before the scan starts.
+
+        Rules applied (in priority order):
+        1. -sn + non-empty ports field → ports silently dropped (auto-resolved).
+        2. dns-brute script against an IP address → warning (user should use a domain).
+        3. -f / --mtu + -sT → fragmentation incompatible with connect scan.
+        4. Raw-socket flags without root/admin privileges → privilege warning.
+        """
+        preset_key = self._preset_var.get()
+        ports_str = self._ports_var.get().strip()
+        target = self._target_var.get().strip()
+        preset = get_by_key(preset_key) if preset_key != "(none)" else None
+
+        # Rule 1: host-discovery preset with a non-empty ports field.
+        if "-sn" in cmd and ports_str:
+            self._log(
+                "[!] CONFLICT (auto-resolved): '-sn' performs host discovery only — "
+                "port specification ignored.\n"
+            )
+
+        # Rule 2: dns-brute script against an IP address or localhost.
+        if preset and "dns-brute" in preset.scripts:
+            if (
+                re.match(r"^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$", target)
+                or target.lower() == "localhost"
+            ):
+                self._log(
+                    f"[!] SCRIPT WARNING: 'dns-brute' requires a domain name, not an IP/localhost "
+                    f"('{target}'). The script will likely fail.\n"
+                )
+
+        # Rule 3: packet fragmentation is incompatible with TCP Connect scan.
+        if ("-f" in cmd or "--mtu" in cmd) and "-sT" in cmd:
+            self._log(
+                "[!] FLAG CONFLICT: '-f'/'--mtu' (packet fragmentation) cannot be combined with "
+                "'-sT' (TCP Connect). Connect scans use OS sockets, not raw packets — "
+                "the fragmentation flag will be ignored by nmap.\n"
+            )
+
+        # Rule 4: raw-socket flags require root / Administrator.
+        try:
+            is_root = os.geteuid() == 0
+        except AttributeError:
+            is_root = True  # Windows — skip this check
+        raw_flags = {"-sS", "-sU", "-O", "-f", "-sX", "-sF", "-sN"}
+        missing_root = [f for f in raw_flags if f in cmd]
+        if missing_root and not is_root:
+            self._log(
+                f"[!] PRIVILEGE WARNING: {' '.join(missing_root)} require root/admin. "
+                "Nmap may downgrade to a TCP Connect scan or fail outright.\n"
+            )
 
     def _start_scan(self) -> None:
         if self._running:
@@ -311,6 +367,7 @@ class DashboardView(ctk.CTkFrame):
 
         cmd = self._build_command()
         self._command_used = " ".join(cmd)
+        self._log_preflight_warnings(cmd)
         self._log(f"[*] Starting scan: {self._command_used}\n")
         self._status_var.set("Scanning…")
 
@@ -534,3 +591,47 @@ class DashboardView(ctk.CTkFrame):
         self._log(f"[*] Command Factory → {command_str}\n")
         self._status_var.set("Scanning…")
         threading.Thread(target=self._scan_worker, args=(parts,), daemon=True).start()
+
+    def load_from_smart_scan(
+        self, endpoints: list[dict[str, Any]], rate: float
+    ) -> None:
+        """Populate the dashboard with open endpoints discovered by Smart Scan.
+
+        Because Smart Scan uses TCP connect probes (no -sV), service names and
+        version strings are not available.  The port table shows "—" for those
+        fields and prompts the user to run a -sV scan for full enumeration.
+        """
+        self._hosts.clear()
+        self._current_host = None
+        self._host_listbox.delete(0, "end")
+        self._port_table.delete("1.0", "end")
+        self._log_text.delete("1.0", "end")
+
+        for ep in endpoints:
+            host = str(ep["host"])
+            port = str(ep["port"])
+            if host not in self._hosts:
+                self._hosts[host] = HostRecord(host)
+                self._host_listbox.insert("end", f"  {host}")
+            self._hosts[host].ports.append({
+                "port": port,
+                "proto": "tcp",
+                "service": "—",
+                "version": "(Smart Scan — run -sV for details)",
+            })
+
+        self._command_used = (
+            f"[Smart Scan adaptive discovery — {rate:.0f} probes/s]"
+        )
+        self._update_stats()
+        self._log(
+            f"[*] Smart Scan results loaded — "
+            f"{len(self._hosts)} host(s), {len(endpoints)} open port(s) "
+            f"at {rate:.0f} probes/s\n"
+            "[!] Service names not available — "
+            "run a -sV enumeration scan on these ports for full details.\n"
+        )
+        self._status_var.set(
+            f"Smart Scan: {len(self._hosts)} host(s), "
+            f"{len(endpoints)} open port(s) discovered"
+        )

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import tkinter as tk
-from typing import Callable
+from typing import Any, Callable
 
 import customtkinter as ctk
 
@@ -185,10 +185,11 @@ class SmartScanView(ctk.CTkFrame):
         cards = ctk.CTkFrame(right, fg_color="transparent")
         cards.grid(row=0, column=0, sticky="ew")
 
-        self._card_rate  = self._stat_card(cards, "Current Rate", "—")
-        self._card_rtt   = self._stat_card(cards, "Filtered RTT", "—")
-        self._card_open  = self._stat_card(cards, "Open Ports", "0")
-        self._card_total = self._stat_card(cards, "Probes Sent", "0")
+        self._card_rate    = self._stat_card(cards, "Current Rate", "—")
+        self._card_rtt     = self._stat_card(cards, "Filtered RTT", "—")
+        self._card_open    = self._stat_card(cards, "Open Ports", "0")
+        self._card_total   = self._stat_card(cards, "Probes Sent", "0")
+        self._card_dropped = self._stat_card(cards, "Timeouts", "0")
 
         # Rate mini-chart (canvas based)
         chart_frame = ctk.CTkFrame(right, fg_color=BG_SECONDARY, corner_radius=CARD_CORNER)
@@ -306,20 +307,27 @@ class SmartScanView(ctk.CTkFrame):
         module = SmartScanModule(cfg)
         loop = asyncio.new_event_loop()
 
+        # Mutable containers shared between _run() closure and the outer scope.
+        all_open: list[dict[str, Any]] = []
+        final_rate_box: list[float] = [cfg.initial_rate]
+
         async def _run() -> None:
             # Use the public discovery_pass to scan all endpoints, then stream
             # per-result feedback by slicing into small batches.
             batch_size = 20
             open_count = 0
             total = 0
+            total_dropped = 0
             for i in range(0, len(endpoints), batch_size):
                 if not self._running:
                     break
                 batch = endpoints[i : i + batch_size]
                 output = await module.discovery_pass(batch)
                 total += output.stats.total_count
+                total_dropped += output.stats.timeout_count
                 for ep in output.open_endpoints:
                     open_count += 1
+                    all_open.append({"host": ep.host, "port": ep.port})
                     rtt_result = next(
                         (r for r in output.all_results if r.endpoint == ep and r.rtt_ms), None
                     )
@@ -328,12 +336,14 @@ class SmartScanView(ctk.CTkFrame):
                         0, self._log_msg,
                         f"[+] OPEN  {ep.host}:{ep.port}  rtt={rtt_str}\n",
                     )
+                final_rate_box[0] = output.stats.final_rate
                 self.after(
                     0, self._update_live,
                     output.stats.final_rate,
                     output.stats.calibration_rtt_filtered_ms,
                     open_count,
                     total,
+                    total_dropped,
                 )
                 self.after(0, self._card_open.configure, {"text": str(open_count)})
 
@@ -341,22 +351,27 @@ class SmartScanView(ctk.CTkFrame):
             loop.run_until_complete(_run())
         finally:
             loop.close()
-            self.after(0, self._scan_done)
+            self.after(0, self._scan_done, all_open, final_rate_box[0])
 
     def _stop_scan(self) -> None:
         self._running = False
 
-    def _scan_done(self) -> None:
+    def _scan_done(self, all_open: list[dict[str, Any]], final_rate: float) -> None:
         self._running = False
         self._run_btn.configure(state="normal")
-        self._status_var.set("Smart scan complete")
+        msg = f"Smart scan complete — {len(all_open)} open endpoint(s) found"
+        self._status_var.set(msg)
+        self._log_msg(f"[*] {msg}\n")
+        if all_open:
+            self._on_hosts_discovered(all_open, final_rate)
 
     # ── UI update helpers ─────────────────────────────────────────────────────
 
-    def _update_live(self, rate: float, rtt: float | None, open_c: int, total: int) -> None:
+    def _update_live(self, rate: float, rtt: float | None, open_c: int, total: int, dropped: int = 0) -> None:
         self._card_rate.configure(text=f"{rate:.0f}/s")
         self._card_rtt.configure(text=f"{rtt:.1f}ms" if rtt else "—")
         self._card_total.configure(text=str(total))
+        self._card_dropped.configure(text=str(dropped))
         self._rate_history.append(rate)
         if len(self._rate_history) > 200:
             self._rate_history.pop(0)
