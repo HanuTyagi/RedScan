@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 
 from .models import ParsedRuntimeEvent
 
-OPEN_PORT_RE = re.compile(r"(?P<port>\d+)/tcp\s+open\s+(?P<service>\S+)")
+OPEN_PORT_RE = re.compile(r"(?P<port>\d+)/(?P<proto>tcp|udp)\s+open\s+(?P<service>\S+)")
 
 
 class RealTimeDataParser:
@@ -33,6 +33,7 @@ class RealTimeDataParser:
                     raw=text,
                     data={
                         "port": int(match.group("port")),
+                        "proto": match.group("proto"),
                         "service": match.group("service"),
                     },
                 )

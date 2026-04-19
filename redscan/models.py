@@ -34,6 +34,11 @@ class DiscoveryConfig(BaseModel):
     loss_window_s: float = Field(default=2.0, gt=0)
     loss_threshold: int = Field(default=20, ge=1)
     aimd_beta: float = Field(default=0.5, gt=0, le=1)
+    # Number of calibration samples collected before RTT_base is locked in.
+    # Prevents the first (often elevated) sample from setting an artificially
+    # high baseline that allows the scanner to run too fast before it has
+    # meaningful RTT data.
+    rtt_base_warmup_samples: int = Field(default=5, ge=1)
 
 
 class DiscoveryStats(BaseModel):

@@ -14,13 +14,16 @@ class CommandFactoryEngine:
         graph = nx.DiGraph()
         graph.add_node("binary", args=["nmap"])
         graph.add_node("preset_flags", args=request.preset.flags)
+        # Connect binary → preset_flags so topological_sort always places
+        # "nmap" first.  Without this edge the isolated node could appear
+        # anywhere in the sorted output.
+        graph.add_edge("binary", "preset_flags")
 
         if request.timing:
             graph.add_node("timing", args=[request.timing])
-            graph.add_edge("preset_flags", "timing")
         else:
             graph.add_node("timing", args=[])
-            graph.add_edge("preset_flags", "timing")
+        graph.add_edge("preset_flags", "timing")
 
         ports = sorted(set(request.ports))
         if ports:

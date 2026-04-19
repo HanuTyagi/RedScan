@@ -11,7 +11,7 @@ class LLMProvider(ABC):
     def name(self) -> str: ...
 
     @abstractmethod
-    async def analyze(self, request: LLMAnalysisRequest) -> LLMAnalysisResult: ...
+    async def analyze(self, request: LLMAnalysisRequest, context: str = "insights") -> LLMAnalysisResult: ...
 
 
 class MockLLMProvider(LLMProvider):
@@ -19,10 +19,23 @@ class MockLLMProvider(LLMProvider):
     def name(self) -> str:
         return "mock"
 
-    async def analyze(self, request: LLMAnalysisRequest) -> LLMAnalysisResult:
+    async def analyze(self, request: LLMAnalysisRequest, context: str = "insights") -> LLMAnalysisResult:
         high_risk_ports = {21, 23, 445, 3389}
         open_ports = {endpoint.port for endpoint in request.open_endpoints}
         risky = sorted(open_ports & high_risk_ports)
+
+        if context == "next_steps":
+            summary = "Based on open ports, consider: deeper service enumeration with -sV, script scanning with -sC, and targeted exploit checks."
+            return LLMAnalysisResult(
+                provider=self.name,
+                summary=summary,
+                risk_level="medium",
+                recommendations=[
+                    "Run nmap -sV -sC -p <open_ports> <target> for service fingerprinting.",
+                    "Use searchsploit or Metasploit to look up CVEs for detected service versions.",
+                    "Check for default credentials on exposed management services.",
+                ],
+            )
 
         if risky:
             risk = "high"
@@ -52,5 +65,5 @@ class LLMAnalysisPipeline:
     def __init__(self, provider: LLMProvider | None = None) -> None:
         self.provider = provider or MockLLMProvider()
 
-    async def run(self, request: LLMAnalysisRequest) -> LLMAnalysisResult:
-        return await self.provider.analyze(request)
+    async def run(self, request: LLMAnalysisRequest, context: str = "insights") -> LLMAnalysisResult:
+        return await self.provider.analyze(request, context=context)

@@ -25,6 +25,17 @@ def _gui_available() -> bool:
 _SKIP_GUI = pytest.mark.skipif(not _gui_available(), reason="No display available")
 
 
+# Skip this entire module when tkinter is not installed.  The non-GUI logic
+# tests (conflict checking, HostRecord serialisation, LLM helpers) all live
+# in files that still import tkinter/customtkinter at the module level, so
+# the import below would raise ModuleNotFoundError before pytest can apply
+# the per-test skip marks.
+try:
+    import tkinter as _tk  # noqa: F401
+except ModuleNotFoundError:
+    pytest.skip("tkinter not available – skipping GUI logic tests", allow_module_level=True)
+
+
 # ---------------------------------------------------------------------------
 # Tests for command_factory conflict logic (pure Python, no GUI needed)
 # ---------------------------------------------------------------------------

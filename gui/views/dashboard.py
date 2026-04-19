@@ -291,7 +291,11 @@ class DashboardView(ctk.CTkFrame):
         if ports_str:
             cmd.extend(["-p", ports_str])
 
-        cmd.extend(["-oG", "-"])   # greppable output for real-time parsing (not XML)
+        # Use default nmap text output (not greppable -oG).
+        # The three regexes (_HOST_RE, _OPEN_PORT_RE, _OS_RE) expect the normal
+        # human-readable format ("Nmap scan report for …", "22/tcp  open  ssh …",
+        # "OS details: …").  Using -oG would produce a completely different format
+        # and those regexes would never match, leaving the dashboard empty.
         cmd.append(target)
         return cmd
 
@@ -313,6 +317,7 @@ class DashboardView(ctk.CTkFrame):
         threading.Thread(target=self._scan_worker, args=(cmd,), daemon=True).start()
 
     def _scan_worker(self, cmd: list[str]) -> None:
+        returncode: int | None = None
         try:
             self._scan_process = subprocess.Popen(
                 cmd,
@@ -345,17 +350,22 @@ class DashboardView(ctk.CTkFrame):
                 if m_os and current_host:
                     self._event_queue.put({"type": "os", "host": current_host, "os": m_os.group(1)})
 
-            self._scan_process.wait()
+            returncode = self._scan_process.wait()
         except FileNotFoundError:
             self._event_queue.put({"type": "line", "text": "[!] nmap not found in PATH"})
         except Exception as exc:
             self._event_queue.put({"type": "line", "text": f"[!] Error: {exc}"})
         finally:
-            self._event_queue.put({"type": "done"})
+            self._event_queue.put({"type": "done", "returncode": returncode})
 
     def _stop_scan(self) -> None:
         if self._scan_process:
             self._scan_process.terminate()
+        # Immediately restore the UI state so the user can start a new scan
+        # without waiting for the worker thread's "done" event.
+        self._running = False
+        self._run_btn.configure(state="normal")
+        self._status_var.set("Scan stopped by user.")
 
     # ── Event polling (called from Tk main thread) ────────────────────────────
 
@@ -402,12 +412,20 @@ class DashboardView(ctk.CTkFrame):
                 self._hosts[host].os_guess = event["os"]
 
         elif etype == "done":
+            returncode = event.get("returncode")
             self._running = False
             self._run_btn.configure(state="normal")
-            self._status_var.set(
-                f"Scan complete — {len(self._hosts)} host(s) found at "
-                f"{datetime.now().strftime('%H:%M:%S')}"
-            )
+            if returncode is not None and returncode != 0:
+                self._status_var.set(
+                    f"Scan finished with error (exit code {returncode}) at "
+                    f"{datetime.now().strftime('%H:%M:%S')}"
+                )
+                self._log(f"[!] nmap exited with code {returncode}\n")
+            else:
+                self._status_var.set(
+                    f"Scan complete — {len(self._hosts)} host(s) found at "
+                    f"{datetime.now().strftime('%H:%M:%S')}"
+                )
 
     # ── Display helpers ───────────────────────────────────────────────────────
 
@@ -493,7 +511,13 @@ class DashboardView(ctk.CTkFrame):
 
     def run_custom_command(self, command_str: str) -> None:
         """Called from Command Factory to run a free-form command string."""
-        parts = command_str.split()
+        import shlex
+        try:
+            parts = shlex.split(command_str)
+        except ValueError:
+            # Malformed quoting — fall back to simple split so the user at
+            # least sees something rather than a silent failure.
+            parts = command_str.split()
         if not parts:
             return
         # Extract target (last non-flag arg)

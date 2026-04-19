@@ -39,11 +39,11 @@ class OpenAIProvider(LLMProvider):
     def name(self) -> str:
         return f"openai/{self._model}"
 
-    async def analyze(self, request: LLMAnalysisRequest) -> LLMAnalysisResult:
+    async def analyze(self, request: LLMAnalysisRequest, context: str = "insights") -> LLMAnalysisResult:
         try:
             import openai  # type: ignore[import]
             client = openai.AsyncOpenAI(api_key=self._key)
-            prompt = _build_prompt(request)
+            prompt = _build_prompt(request, context=context)
             resp = await client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "user", "content": prompt}],
@@ -69,13 +69,16 @@ class GeminiProvider(LLMProvider):
     def name(self) -> str:
         return f"gemini/{self._model}"
 
-    async def analyze(self, request: LLMAnalysisRequest) -> LLMAnalysisResult:
+    async def analyze(self, request: LLMAnalysisRequest, context: str = "insights") -> LLMAnalysisResult:
         try:
             import google.generativeai as genai  # type: ignore[import]
             genai.configure(api_key=self._key)
             model = genai.GenerativeModel(self._model)
-            prompt = _build_prompt(request)
-            resp = await asyncio.get_event_loop().run_in_executor(
+            prompt = _build_prompt(request, context=context)
+            # asyncio.get_event_loop() is deprecated in Python 3.10+; use
+            # asyncio.get_running_loop() inside an async context instead.
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(
                 None, lambda: model.generate_content(prompt)
             )
             raw = resp.text or ""
@@ -132,6 +135,8 @@ def _build_prompt(request: LLMAnalysisRequest, context: str = "insights") -> str
 
 
 def _parse_llm_response(raw: str, provider: str) -> LLMAnalysisResult:
+    import re as _re
+
     # Heuristic extraction: look for risk keyword and bullet points
     lower = raw.lower()
     risk: str = "medium"
@@ -139,8 +144,11 @@ def _parse_llm_response(raw: str, provider: str) -> LLMAnalysisResult:
         risk = "high"
     elif "low risk" in lower or "risk level: low" in lower or "risk: low" in lower:
         risk = "low"
+    # Guard: Pydantic's Literal["low","medium","high"] will raise at runtime if an
+    # unexpected value slips through.
+    if risk not in {"low", "medium", "high"}:
+        risk = "medium"
 
-    import re as _re
     # Match numbered list items.  Pattern captures the text after "N. " up to a
     # sentence boundary, supporting both single-line ("1. foo. 2. bar.") and
     # multi-line ("\n1. foo\n2. bar") LLM output formats.
@@ -154,9 +162,19 @@ def _parse_llm_response(raw: str, provider: str) -> LLMAnalysisResult:
     if not recs:
         recs = [raw[:200]]
 
+    # Truncate summary at the last sentence boundary before 500 chars so the
+    # displayed text is never cut mid-sentence.
+    if len(raw) > 500:
+        # Find the last period/exclamation/question that ends a sentence within
+        # the first 500 characters.
+        boundary = _re.search(r"[.!?][^.!?]*$", raw[:500])
+        summary = raw[:boundary.end()].rstrip() if boundary else raw[:500]
+    else:
+        summary = raw
+
     return LLMAnalysisResult(
         provider=provider,
-        summary=raw[:500],
+        summary=summary,
         risk_level=risk,  # type: ignore[arg-type]
         recommendations=recs[:5],
     )
@@ -426,21 +444,11 @@ class LLMInsightsView(ctk.CTkFrame):
     def _async_insights(self, req: LLMAnalysisRequest, context: str) -> None:
         loop = asyncio.new_event_loop()
         try:
-            if context == "next_steps":
-                # Build a modified request for next-steps prompt
-                prov = self._pipeline.provider
-                # temporarily override prompt via monkeypatch at call time
-                prompt_text = _build_prompt(req, context="next_steps")
-                result = loop.run_until_complete(self._pipeline.run(req))
-                # Wrap the next-steps response
-                result = LLMAnalysisResult(
-                    provider=result.provider,
-                    summary=prompt_text[:100] + " [next-steps mode]",
-                    risk_level=result.risk_level,
-                    recommendations=result.recommendations,
-                )
-            else:
-                result = loop.run_until_complete(self._pipeline.run(req))
+            # Pass context all the way to the provider so it receives the
+            # correct prompt.  Previously the next-steps prompt was built but
+            # never forwarded; the pipeline always received the default
+            # "insights" context, so "What's Next?" never worked.
+            result = loop.run_until_complete(self._pipeline.run(req, context=context))
         finally:
             loop.close()
         self.after(0, self._display_result, result)

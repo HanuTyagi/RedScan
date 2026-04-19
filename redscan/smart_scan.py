@@ -17,6 +17,11 @@ class AdaptiveRateController:
         self._rtt_filtered: float | None = None
         self._rtt_base: float | None = None
         self._timeout_events: deque[float] = deque()
+        # Warm-up counter: RTT_base is not locked in until this many calibration
+        # samples have been collected.  Using the very first (often elevated)
+        # sample as the baseline would set RTT_target too high and allow the
+        # scanner to run faster than safe before meaningful data is available.
+        self._warmup_count: int = 0
 
     def calibration_update(self, rtt_ms: float) -> None:
         if self._rtt_filtered is None:
@@ -24,12 +29,22 @@ class AdaptiveRateController:
         else:
             self._rtt_filtered = (1 - self.cfg.ewma_alpha) * self._rtt_filtered + self.cfg.ewma_alpha * rtt_ms
 
-        if self._rtt_base is None:
-            self._rtt_base = self._rtt_filtered
-        else:
-            self._rtt_base = min(self._rtt_base, self._rtt_filtered)
+        self._warmup_count += 1
+        if self._warmup_count >= self.cfg.rtt_base_warmup_samples:
+            # Only update RTT_base after the warm-up period so the first noisy
+            # samples (e.g. ARP resolution latency) do not inflate the baseline.
+            if self._rtt_base is None:
+                self._rtt_base = self._rtt_filtered
+            else:
+                self._rtt_base = min(self._rtt_base, self._rtt_filtered)
 
     def register_timeout(self) -> None:
+        """Record a calibration-probe timeout as a potential loss event.
+
+        This must only be called for *calibration* probe timeouts, not for
+        timeouts against target hosts (which may legitimately be filtered or
+        offline).  Callers are responsible for enforcing this distinction.
+        """
         now = time.monotonic()
         self._timeout_events.append(now)
         self._prune_timeout_events(now)
@@ -45,6 +60,19 @@ class AdaptiveRateController:
         now = time.monotonic()
         self._prune_timeout_events(now)
 
+        # ── Loss event: AIMD backoff takes precedence over PID this step ──────
+        # Applying both simultaneously would double-penalise the rate.  The
+        # paper specifies that PID error history is reset after backoff to
+        # prevent a derivative kick on the following step.
+        if len(self._timeout_events) >= self.cfg.loss_threshold:
+            self.rate = max(self.cfg.r_min, self.cfg.aimd_beta * self.rate)
+            self._timeout_events.clear()
+            # Reset stored error history to prevent derivative kick
+            self._e_prev = 0.0
+            self._e_prev2 = 0.0
+            return
+
+        # ── Continuous PID update (incremental / velocity form) ───────────────
         rtt_target = self._rtt_base + self.cfg.target_delta_ms
         e_t = rtt_target - self._rtt_filtered
         delta_u = (
@@ -54,10 +82,6 @@ class AdaptiveRateController:
         )
 
         self.rate = max(self.cfg.r_min, min(self.cfg.r_max, self.rate + delta_u))
-
-        if len(self._timeout_events) >= self.cfg.loss_threshold:
-            self.rate = max(self.cfg.r_min, self.cfg.aimd_beta * self.rate)
-            self._timeout_events.clear()
 
         self._e_prev2 = self._e_prev
         self._e_prev = e_t
@@ -90,7 +114,11 @@ class SmartScanModule:
             rtt_ms = (time.perf_counter() - start) * 1000.0
             return ProbeResult(endpoint=endpoint, status="open", rtt_ms=rtt_ms)
         except asyncio.TimeoutError:
-            self.controller.register_timeout()
+            # Do NOT call register_timeout() here.  Target hosts may legitimately
+            # be filtered or offline, so their timeouts are not a path-impairment
+            # signal.  Only calibration-probe timeouts should feed the loss-event
+            # counter; that decision is made in discovery_pass() where the caller
+            # knows whether this probe is a calibration probe.
             return ProbeResult(endpoint=endpoint, status="timeout")
         except (ConnectionRefusedError, OSError):
             rtt_ms = (time.perf_counter() - start) * 1000.0
@@ -138,8 +166,13 @@ class SmartScanModule:
                 for task in done:
                     result = task.result()
                     is_calibration_task = in_flight.pop(task, False)
-                    if is_calibration_task and result.status == "open" and result.rtt_ms is not None:
-                        self.controller.calibration_update(result.rtt_ms)
+                    if is_calibration_task:
+                        if result.status == "open" and result.rtt_ms is not None:
+                            self.controller.calibration_update(result.rtt_ms)
+                        elif result.status == "timeout":
+                            # Only calibration-probe timeouts are a reliable
+                            # congestion signal — register them as loss events.
+                            self.controller.register_timeout()
                     else:
                         results.append(result)
                 pending_map = {task: in_flight[task] for task in pending}
