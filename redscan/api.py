@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import defaultdict
 from collections.abc import AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -36,14 +35,24 @@ def _require_api_key(request: Request) -> None:
 # ── Simple per-IP rate limiter ────────────────────────────────────────────────
 # Set REDSCAN_RATE_LIMIT to the maximum number of scan requests per client per
 # minute.  Set to 0 to disable.  Defaults to 10.
+#
+# The limit is re-read from the environment on every call so that operators can
+# reconfigure it without restarting the server (e.g. via a process supervisor
+# that updates the environment).  Previously it was evaluated once at import
+# time, making runtime changes impossible.
 
-_RATE_LIMIT_MAX = int(os.environ.get("REDSCAN_RATE_LIMIT", "10"))
 _RATE_LIMIT_WINDOW_S = 60.0
-_rate_buckets: dict[str, list[float]] = defaultdict(list)
+# _rate_buckets maps client IP -> list of request timestamps within the window.
+# Using a plain dict (not defaultdict) so we can delete empty entries and
+# prevent the mapping from growing unboundedly across unique client IPs.
+_rate_buckets: dict[str, list[float]] = {}
 
 
 def _check_rate_limit(request: Request) -> None:
-    if _RATE_LIMIT_MAX <= 0:
+    # Read the limit fresh on every call so environment changes take effect
+    # without a restart.
+    rate_limit_max = int(os.environ.get("REDSCAN_RATE_LIMIT", "10"))
+    if rate_limit_max <= 0:
         return  # Disabled
     # Prefer X-Forwarded-For so deployments behind a reverse proxy use the real
     # client IP rather than the proxy's address.  Take only the first (leftmost)
@@ -55,16 +64,22 @@ def _check_rate_limit(request: Request) -> None:
         client_ip = (request.client.host if request.client else "unknown")
     now = time.monotonic()
     window_start = now - _RATE_LIMIT_WINDOW_S
-    times = _rate_buckets[client_ip]
+    times = _rate_buckets.get(client_ip, [])
     # Prune entries outside the rolling window
     while times and times[0] < window_start:
         times.pop(0)
-    if len(times) >= _RATE_LIMIT_MAX:
+    if len(times) >= rate_limit_max:
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limit exceeded: max {_RATE_LIMIT_MAX} requests per {int(_RATE_LIMIT_WINDOW_S)}s",
+            detail=f"Rate limit exceeded: max {rate_limit_max} requests per {int(_RATE_LIMIT_WINDOW_S)}s",
         )
     times.append(now)
+    # Store back (handles both new and existing clients) or discard if now empty.
+    if times:
+        _rate_buckets[client_ip] = times
+    elif client_ip in _rate_buckets:
+        # Bucket became empty after pruning and before the new entry – clean up.
+        del _rate_buckets[client_ip]
 
 
 # Shared dependency list applied to all mutating endpoints.

@@ -109,10 +109,17 @@ def _build_prompt(request: LLMAnalysisRequest, context: str = "insights") -> str
         f"  {e.host}:{e.port}" for e in request.open_endpoints
     ) or "(none)"
 
+    # Include the nmap command that generated these results so the LLM has
+    # the full context (scan type, scripts used, timing, etc.).  Previously
+    # this field was populated in the request object but never forwarded to
+    # the prompt, so the model could not reason about what was or wasn't scanned.
+    command_line = f"Nmap command: {request.nmap_command}\n\n" if request.nmap_command else ""
+
     if context == "next_steps":
         return (
             f"You are a penetration testing assistant.\n"
             f"The following Nmap scan was run against target '{request.target}':\n\n"
+            f"{command_line}"
             f"Open endpoints discovered:\n{findings_text}\n\n"
             f"Additional findings:\n{json.dumps(request.runtime_findings, indent=2)}\n\n"
             "Suggest 3-5 specific follow-up commands or techniques to deepen the assessment. "
@@ -122,6 +129,7 @@ def _build_prompt(request: LLMAnalysisRequest, context: str = "insights") -> str
     return (
         f"You are a network security analyst.\n"
         f"Analyse the following Nmap results for target '{request.target}':\n\n"
+        f"{command_line}"
         f"Open endpoints:\n{findings_text}\n\n"
         f"Additional findings:\n{json.dumps(request.runtime_findings, indent=2)}\n\n"
         "Provide:\n"
@@ -411,6 +419,11 @@ class LLMInsightsView(ctk.CTkFrame):
             self._key_var.set(key)
         if model:
             self._model_var.set(model)
+        # Apply the restored configuration so the pipeline is ready immediately.
+        # Without this call the panel would show the correct provider/key in the
+        # UI but self._pipeline would still be the default MockLLMProvider, and
+        # users would receive mock results until they manually clicked "Apply".
+        self._apply_config()
 
     def _save_config(self, provider: str, key: str, model: str) -> None:
         """Persist provider / API key / model to ~/.redscan_config.json."""

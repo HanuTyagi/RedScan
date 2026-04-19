@@ -628,6 +628,10 @@ class DashboardView(ctk.CTkFrame):
         clean up the temp file afterwards.
         """
         if not _XML_PARSER_AVAILABLE or _parse_nmap_xml is None:
+            self._log(
+                "[i] XML enrichment unavailable (xml_parser module not found). "
+                "Version/OS data from the text stream only.\n"
+            )
             try:
                 os.unlink(xml_path)
             except OSError:
@@ -635,7 +639,8 @@ class DashboardView(ctk.CTkFrame):
             return
         try:
             scan_info = _parse_nmap_xml(xml_path)
-        except Exception:
+        except Exception as exc:
+            self._log(f"[!] XML enrichment failed: {exc}\n")
             scan_info = None
         finally:
             try:
@@ -808,6 +813,15 @@ class DashboardView(ctk.CTkFrame):
         """Public API: select a preset by key. Used by app.py to avoid
         reaching into private widget state."""
         self._preset_var.set(preset_key)
+
+    def start_scan(self) -> None:
+        """Public API: start a scan with the current target / preset / ports.
+
+        Delegates to the internal _start_scan() so that callers (e.g. app.py
+        when a preset is activated from the Preset Browser) do not depend on
+        the private method name.
+        """
+        self._start_scan()
 
     def run_custom_command(self, command_str: str) -> None:
         """Called from Command Factory to run a free-form command string."""

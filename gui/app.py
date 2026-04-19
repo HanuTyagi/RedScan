@@ -50,6 +50,23 @@ class RedScanApp(ctk.CTk):
         self._active_view = tk.StringVar(value="presets")
         self._build_layout()
         self._show_view("presets")
+        # Ensure any running nmap process is terminated when the window is closed.
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── Window close ─────────────────────────────────────────────────────────
+
+    def _on_close(self) -> None:
+        """Stop any running nmap process before destroying the window.
+
+        Without this handler, closing the window while a scan is in progress
+        leaves an orphaned nmap subprocess running until the scan naturally
+        finishes.
+        """
+        try:
+            self._dashboard._stop_scan()
+        except Exception:
+            pass
+        self.destroy()
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -169,7 +186,7 @@ class RedScanApp(ctk.CTk):
         """Preset Library: run a preset on the Dashboard."""
         self._show_view("dashboard")
         self._dashboard.set_preset(preset.key)
-        self._dashboard._start_scan()
+        self._dashboard.start_scan()
 
     def _on_preset_to_factory(self, preset: ScanPreset) -> None:
         """Preset Library: load a preset into the Command Factory canvas."""

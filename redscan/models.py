@@ -33,7 +33,7 @@ class DiscoveryConfig(BaseModel):
     initial_rate: float = Field(default=120.0, gt=0)
     loss_window_s: float = Field(default=2.0, gt=0)
     loss_threshold: int = Field(default=20, ge=1)
-    aimd_beta: float = Field(default=0.5, gt=0, le=1)
+    aimd_beta: float = Field(default=0.5, gt=0, lt=1)
     # Number of calibration samples collected before RTT_base is locked in.
     # Prevents the first (often elevated) sample from setting an artificially
     # high baseline that allows the scanner to run too fast before it has

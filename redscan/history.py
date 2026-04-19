@@ -23,7 +23,11 @@ class ScanHistoryStore:
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or self._DEFAULT_PATH
-        self._lock = threading.Lock()
+        # Use an RLock so that _append (which holds the lock while calling
+        # _load_raw) can re-enter the lock if list_entries is somehow called
+        # from the same thread.  More importantly it allows list_entries to
+        # safely acquire the lock independently of _append.
+        self._lock = threading.RLock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -76,9 +80,10 @@ class ScanHistoryStore:
         return result
 
     def _load_raw(self) -> list[dict]:
-        if not self._path.exists():
-            return []
-        try:
-            return json.loads(self._path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return []
+        with self._lock:
+            if not self._path.exists():
+                return []
+            try:
+                return json.loads(self._path.read_text())
+            except (OSError, json.JSONDecodeError):
+                return []

@@ -191,7 +191,11 @@ class SmartScanModule:
                     result = task.result()
                     is_calibration_task = in_flight.pop(task, False)
                     if is_calibration_task:
-                        if result.status == "open" and result.rtt_ms is not None:
+                        if result.status in ("open", "closed") and result.rtt_ms is not None:
+                            # Accept RST (closed) replies as valid RTT samples.  Some
+                            # calibration endpoints sit behind a firewall that returns
+                            # an immediate RST instead of a SYN-ACK, but the round-trip
+                            # time is still a valid congestion signal.
                             self.controller.calibration_update(result.rtt_ms)
                         elif result.status == "timeout":
                             # Only calibration-probe timeouts are a reliable
