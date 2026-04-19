@@ -272,17 +272,29 @@ class SmartScanView(ctk.CTkFrame):
         if not ports:
             ports = [80]
 
+        # Maximum addressable IPs: /16 = 65534 hosts × ports.  Anything larger
+        # (e.g. a /8) would create millions of Endpoint objects and crash the
+        # process before the first probe is sent.
+        _MAX_HOSTS = 65_534
+
         hosts: list[str] = []
         for token in raw.split(","):
             token = token.strip()
             if not token:
                 continue
             if "/" in token:
-                # Basic CIDR expansion (only /24 for demo)
                 import ipaddress
                 try:
                     net = ipaddress.ip_network(token, strict=False)
-                    hosts.extend(str(ip) for ip in net.hosts())
+                    host_list = list(net.hosts())
+                    if len(host_list) > _MAX_HOSTS:
+                        self._log_msg(
+                            f"[!] CIDR {token} expands to {len(host_list):,} hosts "
+                            f"(limit {_MAX_HOSTS:,}).  "
+                            "Use a /16 or smaller prefix.\n"
+                        )
+                        continue
+                    hosts.extend(str(ip) for ip in host_list)
                 except ValueError:
                     hosts.append(token)
             else:

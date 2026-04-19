@@ -24,8 +24,17 @@ class MockLLMProvider(LLMProvider):
         open_ports = {endpoint.port for endpoint in request.open_endpoints}
         risky = sorted(open_ports & high_risk_ports)
 
+        # Include the nmap command in the summary so the LLM response (and any
+        # real provider that reads request.nmap_command) can reference it.
+        cmd_info = (
+            f" (command: `{request.nmap_command}`)" if request.nmap_command else ""
+        )
+
         if context == "next_steps":
-            summary = "Based on open ports, consider: deeper service enumeration with -sV, script scanning with -sC, and targeted exploit checks."
+            summary = (
+                f"Based on open ports{cmd_info}, consider: deeper service enumeration "
+                "with -sV, script scanning with -sC, and targeted exploit checks."
+            )
             return LLMAnalysisResult(
                 provider=self.name,
                 summary=summary,
@@ -39,18 +48,22 @@ class MockLLMProvider(LLMProvider):
 
         if risky:
             risk = "high"
-            summary = f"High-risk exposed services detected on ports: {', '.join(map(str, risky))}."
+            summary = (
+                f"High-risk exposed services detected on ports: {', '.join(map(str, risky))}{cmd_info}."
+            )
             recs = [
                 "Restrict exposure with firewall rules.",
                 "Enforce strong authentication and patch management.",
             ]
         elif open_ports:
             risk = "medium"
-            summary = "Reachable services discovered; investigate versions and hardening posture."
+            summary = (
+                f"Reachable services discovered{cmd_info}; investigate versions and hardening posture."
+            )
             recs = ["Validate service versions.", "Review least-privilege network access."]
         else:
             risk = "low"
-            summary = "No open ports discovered in current scan scope."
+            summary = f"No open ports discovered in current scan scope{cmd_info}."
             recs = ["Expand scan scope if appropriate.", "Re-run periodically for drift detection."]
 
         return LLMAnalysisResult(

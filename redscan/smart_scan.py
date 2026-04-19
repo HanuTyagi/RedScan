@@ -139,6 +139,31 @@ class SmartScanModule:
                 stats=DiscoveryStats(total_count=0, final_rate=self.controller.rate),
             )
 
+        # ── Pre-flight: warn if calibration endpoint is unreachable ──────────
+        # A single quick probe on startup prevents a silent failure where the
+        # controller never receives any calibration RTT samples and stays at
+        # initial_rate for the entire scan.
+        calib_test = await self._probe(
+            Endpoint(host=self.cfg.calibration_host, port=self.cfg.calibration_port)
+        )
+        _calib_reachable = calib_test.status == "open"
+        # We don't abort on failure — some calibration endpoints respond with
+        # RST (status="closed") which still gives a valid RTT.  Only a true
+        # timeout with no RTT suggests the path is broken.
+        if calib_test.status == "timeout" and calib_test.rtt_ms is None:
+            import warnings
+            warnings.warn(
+                f"Calibration endpoint {self.cfg.calibration_host}:{self.cfg.calibration_port} "
+                "is unreachable (timeout).  The rate controller will have no RTT signal; "
+                "the scan rate will remain fixed at initial_rate.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        elif calib_test.rtt_ms is not None:
+            # Seed the EWMA with this first real sample so the controller starts
+            # with a meaningful baseline instead of waking up blind.
+            self.controller.calibration_update(calib_test.rtt_ms)
+
         results: list[ProbeResult] = []
         queue = deque(endpoints)
         in_flight: dict[asyncio.Task[ProbeResult], bool] = {}

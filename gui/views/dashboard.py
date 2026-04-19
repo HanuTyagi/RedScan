@@ -545,17 +545,27 @@ class DashboardView(ctk.CTkFrame):
         self._status_var.set(f"Session saved → {path}")
 
     def _load_session(self) -> None:
-        from tkinter import filedialog
+        from tkinter import filedialog, messagebox
         path = filedialog.askopenfilename(
             filetypes=[("RedScan Session", "*.json")]
         )
         if not path:
             return
-        data = json.loads(Path(path).read_text())
+        try:
+            data = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror(
+                "Load Failed",
+                f"Could not read session file:\n{exc}",
+            )
+            return
         self._hosts.clear()
         self._host_listbox.delete(0, "end")
         for hd in data.get("hosts", []):
-            record = HostRecord.from_dict(hd)
+            try:
+                record = HostRecord.from_dict(hd)
+            except (KeyError, TypeError):
+                continue  # skip malformed host records; load what we can
             self._hosts[record.host] = record
             self._host_listbox.insert("end", f"  {record.host}")
         self._command_used = data.get("command", "")
@@ -565,6 +575,11 @@ class DashboardView(ctk.CTkFrame):
         )
 
     # ── External API ─────────────────────────────────────────────────────────
+
+    def set_preset(self, preset_key: str) -> None:
+        """Public API: select a preset by key. Used by app.py to avoid
+        reaching into private widget state."""
+        self._preset_var.set(preset_key)
 
     def run_custom_command(self, command_str: str) -> None:
         """Called from Command Factory to run a free-form command string."""

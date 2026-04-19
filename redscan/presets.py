@@ -3,6 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from .models import PresetScanConfig
+from .preset_library import PRESET_CATALOGUE
 
 
 def _extract_timing_level(flag: str) -> int:
@@ -16,28 +17,60 @@ class PresetCollection(BaseModel):
     presets: dict[str, PresetScanConfig] = Field(default_factory=dict)
 
 
+def _catalogue_to_collection() -> PresetCollection:
+    """Build a PresetCollection from the full 29-preset PRESET_CATALOGUE.
+
+    Also injects two legacy alias keys that pre-existing tests and the API's
+    default ScanRequest.preset_key reference.  They map to semantically
+    equivalent entries in the catalogue:
+      'safe_discovery'   → full_connect (-sT -Pn)
+      'deep_enumeration' → version_scan (-sV -sC)
+    """
+    presets: dict[str, PresetScanConfig] = {}
+    for p in PRESET_CATALOGUE:
+        presets[p.key] = PresetScanConfig(
+            name=p.name,
+            description=p.description,
+            flags=list(p.flags),
+            scripts=list(p.scripts),
+            script_args=list(p.script_args),
+            requires_ports=p.requires_ports,
+        )
+
+    # Compatibility aliases ─────────────────────────────────────────────────
+    # These keys are referenced by the API default (ScanRequest.preset_key)
+    # and by pre-existing tests.  They mirror real catalogue entries so callers
+    # can use either form without breaking.
+    presets.setdefault(
+        "safe_discovery",
+        PresetScanConfig(
+            name="Safe Discovery",
+            description="Full TCP connect scan suitable for demo environments (alias → full_connect)",
+            flags=["-sT", "-Pn", "-T4"],
+            scripts=[],
+            script_args=[],
+            requires_ports=True,
+        ),
+    )
+    presets.setdefault(
+        "deep_enumeration",
+        PresetScanConfig(
+            name="Deep Enumeration",
+            description="Version and script enumeration for discovered services (alias → version_scan)",
+            flags=["-sV", "-Pn", "-T4"],
+            scripts=["default"],
+            script_args=[],
+            requires_ports=True,
+        ),
+    )
+    return PresetCollection(presets=presets)
+
+
 class PresetManager:
     """Wraps expert presets and resolves conflicts safely."""
 
     def __init__(self) -> None:
-        self._collection = PresetCollection(
-            presets={
-                "safe_discovery": PresetScanConfig(
-                    name="Safe Discovery",
-                    description="Fast connect scan suitable for demo environments",
-                    flags=["-sT", "-Pn"],
-                    scripts=[],
-                    requires_ports=True,
-                ),
-                "deep_enumeration": PresetScanConfig(
-                    name="Deep Enumeration",
-                    description="Version and script enumeration for discovered open services",
-                    flags=["-sV", "-Pn"],
-                    scripts=["default"],
-                    requires_ports=True,
-                ),
-            }
-        )
+        self._collection = _catalogue_to_collection()
 
     def get(self, key: str) -> PresetScanConfig:
         if key not in self._collection.presets:
@@ -50,8 +83,9 @@ class PresetManager:
         if "-sS" in combined and "-sT" in combined:
             combined = [f for f in combined if f != "-sS"]
 
-        if "-sn" in combined and any(flag.startswith("-p") for flag in combined):
-            combined = [f for f in combined if f != "-sn"]
+        # -sn: host-discovery only, no port-scan phase — silently drop -p* flags
+        if "-sn" in combined:
+            combined = [f for f in combined if not f.startswith("-p")]
 
         valid_timings = [f for f in combined if _extract_timing_level(f) > 0]
         if valid_timings:

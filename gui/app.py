@@ -6,7 +6,9 @@ callback closures so they stay decoupled from each other.
 """
 from __future__ import annotations
 
+import json
 import tkinter as tk
+from pathlib import Path
 from typing import Any
 
 import customtkinter as ctk
@@ -166,7 +168,7 @@ class RedScanApp(ctk.CTk):
     def _on_preset_run(self, preset: ScanPreset) -> None:
         """Preset Library: run a preset on the Dashboard."""
         self._show_view("dashboard")
-        self._dashboard._preset_var.set(preset.key)
+        self._dashboard.set_preset(preset.key)
         self._dashboard._start_scan()
 
     def _on_preset_to_factory(self, preset: ScanPreset) -> None:
@@ -180,8 +182,19 @@ class RedScanApp(ctk.CTk):
         self._dashboard.run_custom_command(command)
 
     def _on_factory_save_preset(self, name: str, desc: str) -> None:
-        """Command Factory: show confirmation (actual persistence is UI-side)."""
-        _info_dialog(self, "Preset Saved", f"'{name}' has been saved to your session presets.")
+        """Command Factory: persist the current command as a JSON entry in
+        ~/.redscan_presets.json so it survives restarts."""
+        command = self._factory.get_command()
+        preset_path = Path.home() / ".redscan_presets.json"
+        try:
+            existing: list[dict[str, Any]] = []
+            if preset_path.exists():
+                existing = json.loads(preset_path.read_text())
+            existing.append({"name": name, "description": desc, "command": command})
+            preset_path.write_text(json.dumps(existing, indent=2))
+            _info_dialog(self, "Preset Saved", f"'{name}' saved to {preset_path}")
+        except OSError as exc:
+            _info_dialog(self, "Save Failed", f"Could not write presets file:\n{exc}")
 
     def _on_ai_insights(self, hosts: list[HostRecord], command: str) -> None:
         """Dashboard: open AI Insights with the current scan context."""

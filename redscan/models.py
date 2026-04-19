@@ -63,6 +63,7 @@ class PresetScanConfig(BaseModel):
     description: str
     flags: list[str] = Field(default_factory=list)
     scripts: list[str] = Field(default_factory=list)
+    script_args: list[str] = Field(default_factory=list)
     requires_ports: bool = False
 
 
@@ -89,6 +90,7 @@ class LLMAnalysisRequest(BaseModel):
     target: str
     open_endpoints: list[Endpoint] = Field(default_factory=list)
     runtime_findings: list[dict[str, Any]] = Field(default_factory=list)
+    nmap_command: str = ""
 
 
 class LLMAnalysisResult(BaseModel):

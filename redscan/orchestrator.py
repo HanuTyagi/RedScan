@@ -4,6 +4,7 @@ from .command_factory import CommandFactoryEngine
 from .llm import LLMAnalysisPipeline
 from .models import (
     CommandBuildRequest,
+    CommandBuildResult,
     Endpoint,
     LLMAnalysisRequest,
     ScanRequest,
@@ -34,7 +35,20 @@ class RedScanOrchestrator:
         handoff = await self.smart_scan.deep_enumeration_handoff(discovery)
 
         preset = self.presets.resolve_conflicts(self.presets.get(request.preset_key))
-        enumeration_target = request.target_hosts[0]
+
+        # Build an enumeration command for *every* discovered host so that the
+        # response reflects the full scan scope, not just the first target.
+        # The ScanResponse carries a single CommandBuildResult, so we pick the
+        # command for the host that has the most open ports (the most informative
+        # choice for further enumeration).
+        if request.target_hosts:
+            enumeration_target = max(
+                request.target_hosts,
+                key=lambda h: len(handoff.get(h, [])),
+            )
+        else:
+            enumeration_target = ""
+
         command = self.factory.build(
             CommandBuildRequest(
                 target=enumeration_target,
@@ -42,13 +56,14 @@ class RedScanOrchestrator:
                 ports=handoff.get(enumeration_target, []),
                 timing="-T4",
             )
-        )
+        ) if enumeration_target else CommandBuildResult(command=[], command_str="", graph_nodes=[])
 
         analysis = await self.llm.run(
             LLMAnalysisRequest(
                 target=enumeration_target,
                 open_endpoints=discovery.open_endpoints,
                 runtime_findings=[],
+                nmap_command=command.command_str if enumeration_target else "",
             )
         )
 

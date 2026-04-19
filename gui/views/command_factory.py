@@ -262,8 +262,10 @@ class CommandFactoryView(ctk.CTkFrame):
             command=self._clear_canvas,
         ).pack(side="left")
 
-        # Initial render
+        # Initial render — defer _redraw_canvas to after the window is mapped so
+        # winfo_width() returns the real pixel width instead of 1.
         self._refresh_palette()
+        self.after(50, self._redraw_canvas)
 
     # ── Palette ──────────────────────────────────────────────────────────────
 
@@ -406,11 +408,28 @@ class CommandFactoryView(ctk.CTkFrame):
         return self._cmd_var.get()
 
     def load_preset(self, preset: ScanPreset) -> None:
-        """Load a preset's flags into the canvas."""
+        """Load a preset's flags into the canvas.
+
+        We match flag pieces by checking whether *all* tokens of the piece
+        appear in the preset flag list as a contiguous subsequence, not just
+        the first token.  This prevents ``-p 1-1024`` from being selected when
+        a preset only has ``-p 80,443`` (different value) and also correctly
+        handles flags like ``-D RND:10`` where the second token carries
+        semantic meaning.
+        """
         self._clear_canvas()
-        token_set: set[str] = set(preset.flags)
+        preset_flags = list(preset.flags)
         for fd in self._flags_data:
-            if fd.first_token in token_set:
+            # Find whether fd.tokens appears as a contiguous subsequence of
+            # preset_flags.  A simple set membership check on the first token
+            # is insufficient for two-token flags whose second token carries
+            # the actual value.
+            n = len(fd.tokens)
+            matched = any(
+                preset_flags[i : i + n] == fd.tokens
+                for i in range(len(preset_flags) - n + 1)
+            )
+            if matched:
                 self._placed.append(fd)
         self._redraw_canvas()
         self._refresh_palette()
