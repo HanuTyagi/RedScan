@@ -1,15 +1,77 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+from collections import defaultdict
 from collections.abc import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from .models import ScanRequest, ScanResponse
+from .history import ScanHistoryStore
+from .models import ScanHistoryEntry, ScanRequest, ScanResponse
 from .orchestrator import RedScanOrchestrator
 
 app = FastAPI(title="RedScan", version="2.0.0")
+
+# Module-level history store (file-backed, thread-safe).
+_history_store = ScanHistoryStore()
+
+# ── Optional API key auth ─────────────────────────────────────────────────────
+# Set the REDSCAN_API_KEY environment variable to enable.  When the variable is
+# absent every request is permitted (suitable for local use).
+
+_API_KEY_ENV = "REDSCAN_API_KEY"
+
+
+def _require_api_key(request: Request) -> None:
+    required = os.environ.get(_API_KEY_ENV)
+    if not required:
+        return  # Auth not configured — allow all
+    if request.headers.get("X-API-Key", "") != required:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
+
+
+# ── Simple per-IP rate limiter ────────────────────────────────────────────────
+# Set REDSCAN_RATE_LIMIT to the maximum number of scan requests per client per
+# minute.  Set to 0 to disable.  Defaults to 10.
+
+_RATE_LIMIT_MAX = int(os.environ.get("REDSCAN_RATE_LIMIT", "10"))
+_RATE_LIMIT_WINDOW_S = 60.0
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _check_rate_limit(request: Request) -> None:
+    if _RATE_LIMIT_MAX <= 0:
+        return  # Disabled
+    # Prefer X-Forwarded-For so deployments behind a reverse proxy use the real
+    # client IP rather than the proxy's address.  Take only the first (leftmost)
+    # value which represents the originating client.
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    else:
+        client_ip = (request.client.host if request.client else "unknown")
+    now = time.monotonic()
+    window_start = now - _RATE_LIMIT_WINDOW_S
+    times = _rate_buckets[client_ip]
+    # Prune entries outside the rolling window
+    while times and times[0] < window_start:
+        times.pop(0)
+    if len(times) >= _RATE_LIMIT_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: max {_RATE_LIMIT_MAX} requests per {int(_RATE_LIMIT_WINDOW_S)}s",
+        )
+    times.append(now)
+
+
+# Shared dependency list applied to all mutating endpoints.
+_guards = [Depends(_require_api_key), Depends(_check_rate_limit)]
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
 @app.get("/health")
@@ -17,15 +79,30 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/scan", response_model=ScanResponse)
+@app.post("/scan", response_model=ScanResponse, dependencies=_guards)
 async def scan(request: ScanRequest) -> ScanResponse:
     # Create a fresh orchestrator per request so concurrent calls don't share
     # controller state or mutate in-flight SmartScanModule instances.
     orchestrator = RedScanOrchestrator()
-    return await orchestrator.run(request)
+    response = await orchestrator.run(request)
+    _history_store.record(request, response)
+    return response
 
 
-@app.post("/scan/stream")
+@app.get("/history", response_model=list[ScanHistoryEntry], dependencies=[Depends(_require_api_key)])
+async def get_history(limit: int = 50) -> list[ScanHistoryEntry]:
+    """Return the most recent scan history entries (newest-last)."""
+    return _history_store.list_entries(limit=min(limit, 200))
+
+
+@app.delete("/history", dependencies=_guards)
+async def clear_history() -> dict[str, str]:
+    """Delete all persisted scan history."""
+    _history_store.clear()
+    return {"status": "cleared"}
+
+
+@app.post("/scan/stream", dependencies=_guards)
 async def scan_stream(request: ScanRequest) -> StreamingResponse:
     """
     True streaming endpoint: yields one NDJSON line per discovered open port
@@ -67,22 +144,20 @@ async def scan_stream(request: ScanRequest) -> StreamingResponse:
                 rtt_result = next(
                     (r for r in output.all_results if r.endpoint == ep and r.rtt_ms), None
                 )
-                line = json.dumps({
+                yield (json.dumps({
                     "type": "open",
                     "host": ep.host,
                     "port": ep.port,
                     "rtt_ms": rtt_result.rtt_ms if rtt_result else None,
-                })
-                yield (line + "\n").encode()
+                }) + "\n").encode()
 
-            stats_line = json.dumps({
+            yield (json.dumps({
                 "type": "stats",
                 "total": cumulative_total,
                 "open": cumulative_open,
                 "timeout": cumulative_timeout,
                 "rate": output.stats.final_rate,
-            })
-            yield (stats_line + "\n").encode()
+            }) + "\n").encode()
 
         # Final enumeration command
         preset = orchestrator.presets.resolve_conflicts(orchestrator.presets.get(request.preset_key))
@@ -92,10 +167,9 @@ async def scan_stream(request: ScanRequest) -> StreamingResponse:
             target=enumeration_target, preset=preset, ports=request.ports, timing="-T4"
         )) if enumeration_target else None
 
-        done_line = json.dumps({
+        yield (json.dumps({
             "type": "done",
             "command": cmd.command_str if cmd else "",
-        })
-        yield (done_line + "\n").encode()
+        }) + "\n").encode()
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")

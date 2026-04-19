@@ -21,6 +21,7 @@ import os
 import queue
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -40,6 +41,25 @@ from redscan.preset_library import PRESET_CATALOGUE, get_by_key
 _OPEN_PORT_RE = re.compile(r"(?P<port>\d+)/(?P<proto>tcp|udp)\s+open\s+(?P<service>\S+)(?:\s+(?P<version>.*))?")
 _HOST_RE = re.compile(r"Nmap scan report for (.+)")
 _OS_RE = re.compile(r"OS details?: (.+)")
+
+# Path to user-saved Command-Factory presets.
+_USER_PRESETS_PATH = Path.home() / ".redscan_presets.json"
+
+# Optional XML enrichment via the root-level xml_parser module.
+# The module lives alongside this package so a sys.path lookup is needed when
+# running from an installed location rather than directly from the source root.
+try:
+    from xml_parser import parse_nmap_xml as _parse_nmap_xml  # type: ignore[import]
+    _XML_PARSER_AVAILABLE = True
+except ImportError:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    try:
+        from xml_parser import parse_nmap_xml as _parse_nmap_xml  # type: ignore[import]
+        _XML_PARSER_AVAILABLE = True
+    except ImportError:
+        _parse_nmap_xml = None  # type: ignore[assignment]
+        _XML_PARSER_AVAILABLE = False
 
 
 class HostRecord:
@@ -84,9 +104,16 @@ class DashboardView(ctk.CTkFrame):
         self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._running = False
         self._command_used = ""
+        # Temporary XML output file for post-scan enrichment (set per scan).
+        self._xml_tempfile: str | None = None
+        # User-defined presets loaded from ~/.redscan_presets.json.
+        # Maps display-name to nmap command string.
+        self._user_presets: dict[str, str] = {}
 
         self._build()
         self._poll_events()
+        # Defer user preset loading until the event loop is running.
+        self.after(200, self._load_user_presets)
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -109,13 +136,14 @@ class DashboardView(ctk.CTkFrame):
         preset_keys = ["(none)"] + [p.key for p in PRESET_CATALOGUE]
         self._preset_var = tk.StringVar(value="(none)")
         ctk.CTkLabel(ctrl, text="Preset:", font=FONT_SMALL).pack(side="left")
-        ctk.CTkComboBox(
+        self._preset_combo = ctk.CTkComboBox(
             ctrl,
             values=preset_keys,
             variable=self._preset_var,
             width=200,
             font=FONT_SMALL,
-        ).pack(side="left", padx=(PAD_S, PAD))
+        )
+        self._preset_combo.pack(side="left", padx=(PAD_S, PAD))
 
         ctk.CTkLabel(ctrl, text="Ports:", font=FONT_SMALL).pack(side="left")
         self._ports_var = tk.StringVar(value="1-1024")
@@ -169,6 +197,19 @@ class DashboardView(ctk.CTkFrame):
             row=0, column=0, padx=PAD, pady=PAD_S, sticky="w"
         )
 
+        # Filter entry
+        filter_row = ctk.CTkFrame(host_panel, fg_color="transparent")
+        filter_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=PAD_S, pady=(0, PAD_S))
+        ctk.CTkLabel(filter_row, text="🔍", font=FONT_SMALL, width=20).pack(side="left")
+        self._filter_var = tk.StringVar()
+        self._filter_var.trace_add("write", self._on_filter_change)
+        ctk.CTkEntry(
+            filter_row,
+            textvariable=self._filter_var,
+            placeholder_text="Filter hosts…",
+            font=FONT_SMALL,
+        ).pack(side="left", fill="x", expand=True, padx=(PAD_S, 0))
+
         self._host_listbox = tk.Listbox(
             host_panel,
             bg="#0d1b2a",
@@ -179,12 +220,13 @@ class DashboardView(ctk.CTkFrame):
             borderwidth=0,
             highlightthickness=0,
         )
-        self._host_listbox.grid(row=1, column=0, sticky="nsew", padx=PAD_S, pady=PAD_S)
+        self._host_listbox.grid(row=2, column=0, sticky="nsew", padx=PAD_S, pady=PAD_S)
         self._host_listbox.bind("<<ListboxSelect>>", self._on_host_select)
 
         host_scroll = tk.Scrollbar(host_panel, command=self._host_listbox.yview)
-        host_scroll.grid(row=1, column=1, sticky="ns")
+        host_scroll.grid(row=2, column=1, sticky="ns")
         self._host_listbox.configure(yscrollcommand=host_scroll.set)
+        host_panel.rowconfigure(2, weight=1)
 
         # Port details panel
         detail_panel = ctk.CTkFrame(mid, fg_color=BG_SECONDARY, corner_radius=CARD_CORNER)
@@ -276,6 +318,30 @@ class DashboardView(ctk.CTkFrame):
         preset_key = self._preset_var.get()
         ports_str = self._ports_var.get().strip()
 
+        # ── User preset: run the stored command, replacing the original target
+        # with the current dashboard target. ──────────────────────────────────
+        if preset_key in self._user_presets:
+            import shlex
+            try:
+                parts = shlex.split(self._user_presets[preset_key])
+            except ValueError:
+                parts = self._user_presets[preset_key].split()
+            # Replace last non-flag argument (the stored target) with current one.
+            if parts and not parts[-1].startswith("-"):
+                parts = parts[:-1] + [target]
+            elif target:
+                parts.append(target)
+            # Inject XML output alongside the user command.
+            self._xml_tempfile = self._new_xml_tempfile()
+            if self._xml_tempfile:
+                parts = list(parts)
+                # Insert -oX before the target (last element).
+                parts.insert(-1, "-oX")
+                parts.insert(-1, self._xml_tempfile)
+            self._command_used = " ".join(parts)
+            return parts
+
+        # ── Normal preset / fallback ──────────────────────────────────────────
         preset = get_by_key(preset_key) if preset_key != "(none)" else None
 
         cmd: list[str] = ["nmap"]
@@ -294,6 +360,13 @@ class DashboardView(ctk.CTkFrame):
         if ports_str and "-sn" not in cmd:
             cmd.extend(["-p", ports_str])
 
+        # Write XML to a temp file in addition to the default text output.
+        # Both formats can coexist: nmap streams text to stdout while writing
+        # XML to the file.  We parse the XML post-scan for richer version/OS data.
+        self._xml_tempfile = self._new_xml_tempfile()
+        if self._xml_tempfile:
+            cmd.extend(["-oX", self._xml_tempfile])
+
         # Use default nmap text output (not greppable -oG).
         # The three regexes (_HOST_RE, _OPEN_PORT_RE, _OS_RE) expect the normal
         # human-readable format ("Nmap scan report for …", "22/tcp  open  ssh …",
@@ -301,6 +374,16 @@ class DashboardView(ctk.CTkFrame):
         # and those regexes would never match, leaving the dashboard empty.
         cmd.append(target)
         return cmd
+
+    @staticmethod
+    def _new_xml_tempfile() -> str | None:
+        """Create a temp file for nmap XML output.  Returns None on failure."""
+        try:
+            fd, path = tempfile.mkstemp(prefix="redscan_", suffix=".xml")
+            os.close(fd)
+            return path
+        except OSError:
+            return None
 
     def _log_preflight_warnings(self, cmd: list[str]) -> None:
         """Detect known Nmap flag conflicts and log advisory messages before the scan starts.
@@ -483,12 +566,157 @@ class DashboardView(ctk.CTkFrame):
                     f"Scan complete — {len(self._hosts)} host(s) found at "
                     f"{datetime.now().strftime('%H:%M:%S')}"
                 )
+            # Enrich host records from the XML output file (richer version/OS data).
+            if self._xml_tempfile:
+                self._enrich_from_xml(self._xml_tempfile)
+                self._xml_tempfile = None
 
     # ── Display helpers ───────────────────────────────────────────────────────
 
     def _log(self, text: str) -> None:
         self._log_text.insert("end", text)
         self._log_text.see("end")
+
+    def _on_filter_change(self, *_: Any) -> None:
+        """Re-populate the host listbox with hosts matching the filter text."""
+        query = self._filter_var.get().strip().lower()
+        self._host_listbox.delete(0, "end")
+        for host in self._hosts:
+            if not query or query in host.lower():
+                self._host_listbox.insert("end", f"  {host}")
+
+    def _load_user_presets(self) -> None:
+        """Load Command-Factory presets from ~/.redscan_presets.json.
+
+        Each entry is added to the preset ComboBox with the name as given.
+        Entries are prefixed with "[user] " to distinguish them from the
+        built-in catalogue presets.
+        """
+        if not _USER_PRESETS_PATH.exists():
+            return
+        try:
+            entries: list[dict[str, Any]] = json.loads(_USER_PRESETS_PATH.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(entries, list):
+            return
+        added: list[str] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            command = str(item.get("command", "")).strip()
+            if name and command:
+                display = f"[user] {name}"
+                self._user_presets[display] = command
+                added.append(display)
+        if added:
+            current = list(self._preset_combo.cget("values"))
+            new_values = current + [k for k in added if k not in current]
+            self._preset_combo.configure(values=new_values)
+
+    def _enrich_from_xml(self, xml_path: str) -> None:
+        """Parse nmap's XML output and update host records with richer data.
+
+        The text-based parser captures port/proto/service/version via regex.
+        The XML output additionally provides:
+          - Accurate service product strings (e.g. "nginx 1.18.0")
+          - OS detection matches with confidence percentages
+          - NSE script output per port
+
+        We merge this data into existing host records (updating in place) and
+        clean up the temp file afterwards.
+        """
+        if not _XML_PARSER_AVAILABLE or _parse_nmap_xml is None:
+            try:
+                os.unlink(xml_path)
+            except OSError:
+                pass
+            return
+        try:
+            scan_info = _parse_nmap_xml(xml_path)
+        except Exception:
+            scan_info = None
+        finally:
+            try:
+                os.unlink(xml_path)
+            except OSError:
+                pass
+
+        if not scan_info or not scan_info.get("hosts"):
+            return
+
+        for host_data in scan_info["hosts"]:
+            # Resolve primary IP address
+            ip = next(
+                (a["addr"] for a in host_data.get("addresses", []) if a.get("type") == "ipv4"),
+                None,
+            ) or next(
+                (a["addr"] for a in host_data.get("addresses", []) if a.get("addr")),
+                None,
+            )
+            if not ip:
+                continue
+
+            # The dashboard may have recorded the host under its hostname
+            # ("hostname.local") or its IP.  Try both.
+            record = self._hosts.get(ip)
+            if record is None:
+                # Also try the first hostname listed by nmap
+                hostnames = host_data.get("hostnames", [])
+                for hn in hostnames:
+                    record = self._hosts.get(hn)
+                    if record:
+                        break
+            if record is None:
+                continue  # Host not tracked by the text parser (shouldn't happen)
+
+            # ── OS guess ──────────────────────────────────────────────────────
+            os_matches = host_data.get("os_matches", [])
+            if os_matches:
+                best = os_matches[0]
+                record.os_guess = f"{best['name']} ({best.get('accuracy', '?')}%)"
+
+            # ── Port enrichment ───────────────────────────────────────────────
+            # Build a lookup by (port, protocol) from the XML.
+            xml_ports: dict[tuple[str, str], dict[str, Any]] = {}
+            for p in host_data.get("ports", []):
+                if p.get("state") == "open":
+                    xml_ports[(str(p["port"]), str(p.get("protocol", "tcp")))] = p
+
+            # Update existing port records with richer version data.
+            for port_rec in record.ports:
+                key = (str(port_rec["port"]), str(port_rec.get("proto", "tcp")))
+                xml_p = xml_ports.get(key)
+                if xml_p:
+                    product = xml_p.get("product", "").strip()
+                    version = xml_p.get("version", "").strip()
+                    full_version = f"{product} {version}".strip()
+                    if full_version:
+                        port_rec["version"] = full_version
+                    if xml_p.get("service") and xml_p["service"] != "Unknown":
+                        port_rec["service"] = xml_p["service"]
+
+            # Add any ports that were in the XML but missed by the text regex
+            # (rare but possible for filtered/closed ports shown in XML).
+            existing_keys = {
+                (str(p["port"]), str(p.get("proto", "tcp"))) for p in record.ports
+            }
+            for (port_num, proto), xml_p in xml_ports.items():
+                if (port_num, proto) not in existing_keys:
+                    product = xml_p.get("product", "").strip()
+                    version = xml_p.get("version", "").strip()
+                    record.ports.append({
+                        "port": port_num,
+                        "proto": proto,
+                        "service": xml_p.get("service", "unknown"),
+                        "version": f"{product} {version}".strip(),
+                    })
+
+        # Re-render the currently-selected host table with enriched data.
+        if self._current_host:
+            self._refresh_port_table(self._current_host)
+        self._update_stats()
 
     def _on_host_select(self, _: tk.Event) -> None:  # type: ignore[type-arg]
         sel = self._host_listbox.curselection()

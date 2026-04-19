@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tkinter as tk
+from pathlib import Path
 from typing import Any
 
 import customtkinter as ctk
@@ -75,12 +76,9 @@ class GeminiProvider(LLMProvider):
             genai.configure(api_key=self._key)
             model = genai.GenerativeModel(self._model)
             prompt = _build_prompt(request, context=context)
-            # asyncio.get_event_loop() is deprecated in Python 3.10+; use
-            # asyncio.get_running_loop() inside an async context instead.
-            loop = asyncio.get_running_loop()
-            resp = await loop.run_in_executor(
-                None, lambda: model.generate_content(prompt)
-            )
+            # Run the synchronous SDK call in a thread pool so we don't block
+            # the event loop.  asyncio.to_thread is available in Python 3.9+.
+            resp = await asyncio.to_thread(model.generate_content, prompt)
             raw = resp.text or ""
             return _parse_llm_response(raw, self.name)
         except Exception as exc:
@@ -184,6 +182,9 @@ def _parse_llm_response(raw: str, provider: str) -> LLMAnalysisResult:
 # View
 # ---------------------------------------------------------------------------
 
+_CONFIG_PATH = Path.home() / ".redscan_config.json"
+
+
 class LLMInsightsView(ctk.CTkFrame):
     """LLM configuration and AI insights panel."""
 
@@ -196,6 +197,8 @@ class LLMInsightsView(ctk.CTkFrame):
         self._command_used = ""
         self._pipeline = LLMAnalysisPipeline()
         self._build()
+        # Defer config loading until the main event loop is running.
+        self.after(100, self._load_config)
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -388,6 +391,35 @@ class LLMInsightsView(ctk.CTkFrame):
 
         self._pipeline = LLMAnalysisPipeline(prov)
         self._status_var.set(f"Provider set: {prov.name}")
+        self._save_config(provider_name, key, model)
+
+    def _load_config(self) -> None:
+        """Load saved provider / API key / model from ~/.redscan_config.json."""
+        if not _CONFIG_PATH.exists():
+            return
+        try:
+            cfg: dict[str, Any] = json.loads(_CONFIG_PATH.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        provider = cfg.get("provider", "")
+        key = cfg.get("api_key", "")
+        model = cfg.get("model", "")
+        if provider in ("OpenAI", "Gemini", "Mock (offline)"):
+            self._provider_var.set(provider)
+            self._on_provider_change(provider)
+        if key:
+            self._key_var.set(key)
+        if model:
+            self._model_var.set(model)
+
+    def _save_config(self, provider: str, key: str, model: str) -> None:
+        """Persist provider / API key / model to ~/.redscan_config.json."""
+        try:
+            _CONFIG_PATH.write_text(
+                json.dumps({"provider": provider, "api_key": key, "model": model}, indent=2)
+            )
+        except OSError:
+            pass  # Non-fatal
 
     # ── Context loading ──────────────────────────────────────────────────────
 
@@ -421,6 +453,7 @@ class LLMInsightsView(ctk.CTkFrame):
             target=target,
             open_endpoints=endpoints,
             runtime_findings=findings,
+            nmap_command=self._command_used,
         )
 
     def _run_insights(self) -> None:

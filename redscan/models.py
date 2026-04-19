@@ -111,3 +111,13 @@ class ScanResponse(BaseModel):
     discovery: DiscoveryOutput
     command: CommandBuildResult
     analysis: LLMAnalysisResult
+
+
+class ScanHistoryEntry(BaseModel):
+    scan_id: str
+    timestamp: str
+    target_hosts: list[str]
+    preset_key: str
+    open_count: int
+    command_str: str
+    risk_level: str

@@ -146,7 +146,6 @@ class SmartScanModule:
         calib_test = await self._probe(
             Endpoint(host=self.cfg.calibration_host, port=self.cfg.calibration_port)
         )
-        _calib_reachable = calib_test.status == "open"
         # We don't abort on failure — some calibration endpoints respond with
         # RST (status="closed") which still gives a valid RTT.  Only a true
         # timeout with no RTT suggests the path is broken.
