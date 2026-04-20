@@ -99,6 +99,7 @@ class RedScanApp(ctk.CTk):
             self._content,
             on_run_command=self._on_factory_run,
             on_save_preset=self._on_factory_save_preset,
+            on_explain_command=self._on_factory_explain,
         )
         self._smart_scan = SmartScanView(
             self._content,
@@ -212,6 +213,12 @@ class RedScanApp(ctk.CTk):
             _info_dialog(self, "Preset Saved", f"'{name}' saved to {preset_path}")
         except OSError as exc:
             _info_dialog(self, "Save Failed", f"Could not write presets file:\n{exc}")
+
+    def _on_factory_explain(self, command: str) -> None:
+        """Command Factory: send the built command to the LLM panel for
+        a plain-English explanation."""
+        self._llm_panel.load_context([], command)
+        self._show_view("llm")
 
     def _on_ai_insights(self, hosts: list[HostRecord], command: str) -> None:
         """Dashboard: open AI Insights with the current scan context."""

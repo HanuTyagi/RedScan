@@ -19,8 +19,10 @@ saved as a named preset.
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import tkinter as tk
+import tkinter.filedialog as filedialog
 from typing import Callable
 
 import customtkinter as ctk
@@ -31,7 +33,9 @@ from gui.styles import (
     PAD_S, TEXT_MUTED, TEXT_PRIMARY,
 )
 from redscan.conflict_manager import ConflictManager
-from redscan.preset_library import ScanPreset
+from redscan.preset_library import (
+    CATEGORY_ICONS, CATEGORY_ORDER, ScanPreset, get_by_category,
+)
 
 # Shared, stateless conflict manager instance
 _factory_conflict_manager = ConflictManager()
@@ -264,20 +268,28 @@ class CommandFactoryView(ctk.CTkFrame):
         master: ctk.CTk | ctk.CTkFrame,
         on_run_command: Callable[[str], None],
         on_save_preset: Callable[[str, str], None],
+        on_explain_command: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(master, fg_color="transparent")
         self._on_run = on_run_command
         self._on_save = on_save_preset
+        self._on_explain = on_explain_command
 
         self._flags_data = [_FlagPieceData(*f) for f in _FLAG_DEFS]
         self._placed: list[_FlagPieceData] = []
         # Track canvas item IDs for animation
         self._new_piece_ids: list[tuple[int, int]] = []  # [(rect_id, step)]
 
+        # Command history — most recent runs (capped at 10)
+        self._history: list[str] = []
+
         self._target_var = tk.StringVar(value="192.168.1.1")
         self._target_var.trace_add("write", lambda *_: self._update_preview())
         self._ports_var = tk.StringVar(value="")
         self._ports_var.trace_add("write", lambda *_: self._update_preview())
+
+        # Palette search variable (wired to _refresh_palette in _build)
+        self._search_var = tk.StringVar(value="")
 
         self._build()
 
@@ -303,13 +315,38 @@ class CommandFactoryView(ctk.CTkFrame):
             text_color=TEXT_MUTED,
         ).pack(side="left", padx=PAD)
 
-        # ── Left: palette ────────────────────────────────────────────────────
+        # ── Left: search + palette ────────────────────────────────────────────
+        left_panel = ctk.CTkFrame(self, fg_color=BG_SECONDARY, corner_radius=CARD_CORNER)
+        left_panel.grid(row=1, column=0, sticky="nsew", padx=(PAD, PAD_S), pady=PAD)
+        left_panel.columnconfigure(0, weight=1)
+        left_panel.rowconfigure(0, weight=0)
+        left_panel.rowconfigure(1, weight=0)
+        left_panel.rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(
+            left_panel,
+            text="Flag & Script Palette",
+            font=("Segoe UI", 10, "bold"),
+            text_color="#5588aa",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=PAD_S, pady=(PAD_S, 0))
+
+        # Palette search/filter entry
+        self._search_var.trace_add("write", lambda *_: self._refresh_palette())
+        search_entry = ctk.CTkEntry(
+            left_panel,
+            textvariable=self._search_var,
+            placeholder_text="🔍  Filter flags…",
+            font=FONT_SMALL,
+            height=28,
+        )
+        search_entry.grid(row=1, column=0, sticky="ew", padx=PAD_S, pady=(PAD_S, 2))
+
         self._palette_frame = ctk.CTkScrollableFrame(
-            self, width=240, fg_color=BG_SECONDARY, label_text="Flag & Script Palette"
+            left_panel,
+            fg_color="transparent",
         )
-        self._palette_frame.grid(
-            row=1, column=0, sticky="nsew", padx=(PAD, PAD_S), pady=PAD
-        )
+        self._palette_frame.grid(row=2, column=0, sticky="nsew")
 
         # ── Right: canvas ────────────────────────────────────────────────────
         canvas_outer = ctk.CTkFrame(self, fg_color=BG_SECONDARY, corner_radius=CARD_CORNER)
@@ -347,7 +384,16 @@ class CommandFactoryView(ctk.CTkFrame):
             textvariable=self._target_var,
             width=200,
             font=FONT_SMALL,
-        ).pack(side="left", padx=(0, PAD))
+        ).pack(side="left", padx=(0, PAD_S))
+
+        # CIDR host-count label — updated in _update_cidr_label()
+        self._cidr_lbl = ctk.CTkLabel(
+            tp_row,
+            text="",
+            font=("Segoe UI", 9),
+            text_color="#88bbff",
+        )
+        self._cidr_lbl.pack(side="left", padx=(0, PAD))
 
         ctk.CTkLabel(tp_row, text="Ports:", font=FONT_SMALL, width=44).pack(side="left")
         self._ports_entry = ctk.CTkEntry(
@@ -367,7 +413,7 @@ class CommandFactoryView(ctk.CTkFrame):
         )
         self._ports_status_lbl.pack(side="left", padx=(0, PAD_S))
 
-        # Command preview row
+        # Command preview row (with history button)
         preview_row = ctk.CTkFrame(bottom, fg_color="transparent")
         preview_row.pack(fill="x", padx=PAD, pady=PAD_S)
 
@@ -383,6 +429,19 @@ class CommandFactoryView(ctk.CTkFrame):
             anchor="w",
         )
         self._cmd_label.pack(side="left", fill="x", expand=True)
+
+        # History drop-down button next to the command preview
+        ctk.CTkButton(
+            preview_row,
+            text="📋",
+            width=32,
+            height=28,
+            font=("Segoe UI", 13),
+            fg_color="#1a3050",
+            hover_color="#2a5080",
+            corner_radius=6,
+            command=self._show_history_popup,
+        ).pack(side="right", padx=(PAD_S, 0))
 
         # Conflict warning bar (hidden when command is clean)
         self._conflict_bar = ctk.CTkFrame(
@@ -432,6 +491,24 @@ class CommandFactoryView(ctk.CTkFrame):
             hover_color="#5a2a2a",
             corner_radius=BTN_CORNER,
             command=self._clear_canvas,
+        ).pack(side="left", padx=(0, PAD_S))
+
+        ctk.CTkButton(
+            btn_row,
+            text="📂  Template",
+            fg_color="#1a3a2a",
+            hover_color="#2a5a3a",
+            corner_radius=BTN_CORNER,
+            command=self._show_template_dialog,
+        ).pack(side="left", padx=(0, PAD_S))
+
+        ctk.CTkButton(
+            btn_row,
+            text="🤖  Explain",
+            fg_color="#2a1a3a",
+            hover_color="#4a2a5a",
+            corner_radius=BTN_CORNER,
+            command=self._explain_command,
         ).pack(side="left")
 
         self._refresh_palette()
@@ -446,6 +523,8 @@ class CommandFactoryView(ctk.CTkFrame):
         placed_tokens: set[str] = {f.first_token for f in self._placed}
         placed_cats: set[str]   = {f.category for f in self._placed}
         hard_conflicts           = _check_hard_conflict(self._placed)
+        search = getattr(self, "_search_var", None)
+        search_term = search.get().strip().lower() if search else ""
 
         current_cat = ""
         for fd in self._flags_data:
@@ -475,6 +554,13 @@ class CommandFactoryView(ctk.CTkFrame):
                     blocked = True
                     break
             if blocked:
+                continue
+
+            # Search / filter — hide items that don't match the typed term
+            if search_term and not any(
+                search_term in s.lower()
+                for s in (fd.label, fd.desc, fd.category, fd.first_token)
+            ):
                 continue
 
             # Category header
@@ -525,10 +611,44 @@ class CommandFactoryView(ctk.CTkFrame):
             ).pack(fill="x", padx=(PAD_S + 4, PAD_S))
 
     def _place_piece(self, fd: _FlagPieceData) -> None:
+        # For output flags that write to a file, ask the user to choose a path.
+        if fd.category == "output" and fd.first_token in {"-oN", "-oX", "-oG"}:
+            fd = self._prompt_output_path(fd)
         self._placed.append(fd)
         self._refresh_palette()
         self._redraw_canvas(new_piece=fd)
         self._update_preview()
+
+    def _prompt_output_path(self, fd: _FlagPieceData) -> _FlagPieceData:
+        """Open a save-file dialog so the user can choose the output path for
+        nmap output flags (-oN, -oX, -oG).  Returns a new _FlagPieceData with
+        the chosen path, or the original (with its default path) if cancelled.
+        """
+        ext_map = {"-oN": ".txt", "-oX": ".xml", "-oG": ".gnmap"}
+        ext = ext_map.get(fd.first_token, ".txt")
+        try:
+            path = filedialog.asksaveasfilename(
+                parent=self,
+                title=f"Choose output file for {fd.first_token}",
+                defaultextension=ext,
+                filetypes=[
+                    ("All files", "*.*"),
+                    ("Text files", "*.txt"),
+                    ("XML files", "*.xml"),
+                    ("Grepable files", "*.gnmap"),
+                ],
+            )
+        except Exception:
+            path = ""
+        if not path:
+            return fd
+        short = os.path.basename(path)
+        return _FlagPieceData(
+            tokens=[fd.first_token, path],
+            label=f"{fd.first_token}  {short}",
+            category=fd.category,
+            desc=f"Output to {short}",
+        )
 
     def _remove_piece(self, fd: _FlagPieceData) -> None:
         self._placed = [p for p in self._placed if p is not fd]
@@ -647,6 +767,7 @@ class CommandFactoryView(ctk.CTkFrame):
         target = self._target_var.get().strip() or "<target>"
         parts.append(target)
         self._cmd_var.set(" ".join(parts))
+        self._update_cidr_label(target)
         self._refresh_port_gate(parts)
         self._refresh_conflict_bar(parts, target)
 
@@ -756,7 +877,15 @@ class CommandFactoryView(ctk.CTkFrame):
         self._update_preview()
 
     def _run_command(self) -> None:
-        self._on_run(self.get_command())
+        cmd = self.get_command()
+        # Record in history (dedup, most-recent-first, capped at 10)
+        if cmd and "<no flags" not in cmd:
+            if cmd in self._history:
+                self._history.remove(cmd)
+            self._history.append(cmd)
+            if len(self._history) > 10:
+                self._history.pop(0)
+        self._on_run(cmd)
 
     def _save_preset_dialog(self) -> None:
         dlg = ctk.CTkToplevel(self)
@@ -781,3 +910,158 @@ class CommandFactoryView(ctk.CTkFrame):
 
         ctk.CTkButton(dlg, text="Save", fg_color=ACCENT, command=_save).pack(pady=PAD)
 
+    # ── New enhancement methods ───────────────────────────────────────────────
+
+    def _update_cidr_label(self, target: str) -> None:
+        """Show an approximate host count when the target contains a CIDR prefix."""
+        if "/" in target:
+            try:
+                net = ipaddress.ip_network(target, strict=False)
+                count = net.num_addresses
+                # For IPv4 subtract network and broadcast addresses
+                if net.version == 4 and count > 2:
+                    count -= 2
+                self._cidr_lbl.configure(text=f"(~{count:,} hosts)", text_color="#88bbff")
+                return
+            except ValueError:
+                pass
+        self._cidr_lbl.configure(text="")
+
+    def _show_history_popup(self) -> None:
+        """Show the last 10 run commands in a popup; clicking Re-run sends them
+        to the dashboard immediately."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Command History")
+        popup.geometry("740x320")
+        popup.grab_set()
+
+        if not self._history:
+            ctk.CTkLabel(
+                popup,
+                text="No commands in history yet.\nRun a command to start recording.",
+                font=FONT_SMALL,
+                justify="center",
+            ).pack(padx=PAD, pady=PAD, expand=True)
+            ctk.CTkButton(popup, text="Close", command=popup.destroy).pack(pady=(0, PAD))
+            return
+
+        ctk.CTkLabel(
+            popup,
+            text="Recent commands — click ▶ Run to send directly to the Dashboard:",
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(padx=PAD, pady=(PAD, 0), anchor="w")
+
+        frame = ctk.CTkScrollableFrame(popup, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=PAD, pady=PAD_S)
+
+        for cmd in reversed(self._history):
+            row = ctk.CTkFrame(frame, fg_color="#1a2a3a", corner_radius=6)
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(
+                row,
+                text=cmd,
+                font=FONT_MONO,
+                text_color="#7feeaa",
+                anchor="w",
+                wraplength=580,
+            ).pack(side="left", fill="x", expand=True, padx=PAD_S, pady=4)
+            ctk.CTkButton(
+                row,
+                text="▶ Run",
+                width=70,
+                height=28,
+                font=FONT_SMALL,
+                fg_color=ACCENT,
+                hover_color=ACCENT_HOVER,
+                corner_radius=6,
+                command=lambda c=cmd: (self._on_run(c), popup.destroy()),
+            ).pack(side="right", padx=(0, PAD_S), pady=4)
+
+        ctk.CTkButton(popup, text="Close", command=popup.destroy).pack(pady=(0, PAD))
+
+    def _show_template_dialog(self) -> None:
+        """Show a dialog listing preset categories so the user can pre-load a
+        representative template onto the canvas."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Start from Template")
+        popup.geometry("480x440")
+        popup.grab_set()
+
+        ctk.CTkLabel(
+            popup,
+            text="Choose a preset category to pre-load its flags onto the canvas:",
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(padx=PAD, pady=(PAD, 0), anchor="w")
+
+        groups = get_by_category()
+        frame = ctk.CTkScrollableFrame(popup, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=PAD, pady=PAD_S)
+
+        for cat in CATEGORY_ORDER:
+            presets = groups.get(cat, [])
+            if not presets:
+                continue
+            preset = presets[0]  # first preset is the representative
+            icon = CATEGORY_ICONS.get(cat, "📄")
+
+            row = ctk.CTkFrame(frame, fg_color="#1a2a3a", corner_radius=8)
+            row.pack(fill="x", pady=3)
+            row.columnconfigure(0, weight=1)
+
+            info = ctk.CTkFrame(row, fg_color="transparent")
+            info.pack(side="left", fill="x", expand=True, padx=PAD_S, pady=PAD_S)
+            ctk.CTkLabel(
+                info,
+                text=f"{icon}  {cat}",
+                font=("Segoe UI", 11, "bold"),
+                text_color="#aaddff",
+                anchor="w",
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                info,
+                text=f"e.g. {preset.name}",
+                font=FONT_SMALL,
+                text_color="#6a8aaa",
+                anchor="w",
+            ).pack(anchor="w")
+
+            ctk.CTkButton(
+                row,
+                text="Load",
+                width=70,
+                height=28,
+                font=FONT_SMALL,
+                fg_color="#1e4a6e",
+                hover_color="#2a6a9e",
+                corner_radius=6,
+                command=lambda p=preset: (self.load_preset(p), popup.destroy()),
+            ).pack(side="right", padx=PAD_S, pady=PAD_S)
+
+        ctk.CTkButton(popup, text="Cancel", command=popup.destroy).pack(
+            pady=(0, PAD)
+        )
+
+    def _explain_command(self) -> None:
+        """Send the current command to the LLM panel for a plain-English
+        explanation.  If no callback was wired, shows a small info dialog."""
+        cmd = self.get_command()
+        if self._on_explain:
+            self._on_explain(cmd)
+        else:
+            dlg = ctk.CTkToplevel(self)
+            dlg.title("Explain Command")
+            dlg.geometry("440x160")
+            dlg.grab_set()
+            ctk.CTkLabel(
+                dlg,
+                text=(
+                    "The LLM Insights panel is not connected.\n"
+                    "Navigate to the AI Insights view to use this feature."
+                ),
+                font=FONT_SMALL,
+                justify="center",
+                wraplength=400,
+            ).pack(padx=PAD, pady=PAD, expand=True)
+            ctk.CTkButton(dlg, text="OK", command=dlg.destroy).pack(pady=(0, PAD))
