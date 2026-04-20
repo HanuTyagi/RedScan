@@ -18,7 +18,7 @@ class PresetCollection(BaseModel):
 
 
 def _catalogue_to_collection() -> PresetCollection:
-    """Build a PresetCollection from the full 29-preset PRESET_CATALOGUE.
+    """Build a PresetCollection from the full PRESET_CATALOGUE (80+ presets).
 
     Also injects two legacy alias keys that pre-existing tests and the API's
     default ScanRequest.preset_key reference.  They map to semantically

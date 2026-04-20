@@ -168,9 +168,9 @@ python scan.py
 └──────────────┴─────────────────────────────────────────────────────┘
 ```
 
-**Preset Library** – Search/filter 29 scans by name, description, or flags.
-Click *Run* to execute on the Dashboard, or *To Factory* to inspect the flags
-on the canvas.
+**Preset Library** – Search/filter 80+ scans across 9 categories by name, description, or flags.
+Click a category tile to browse its presets, click *Run* to execute on the Dashboard, or
+*To Factory* to inspect the flags on the canvas.
 
 **Command Factory** – Pick flag pieces from the left palette; they snap to
 the canvas.  Single-select categories (scan type, timing, port scope) are

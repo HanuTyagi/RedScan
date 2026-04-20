@@ -146,7 +146,7 @@ class PresetCard(ctk.CTkFrame):
         badges: list[str] = []
         if preset.requires_root:
             badges.append("⚠ root")
-        if getattr(preset, "requires_domain", False):
+        if preset.requires_domain:
             badges.append("🌐 domain")
         if badges:
             ctk.CTkLabel(
