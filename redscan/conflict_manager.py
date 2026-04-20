@@ -22,6 +22,12 @@ Usage
 
     # `clean_cmd`  — possibly mutated list[str] (auto-fixes applied)
     # `messages`   — list of (severity, text) tuples for display
+
+Port-input gating
+-----------------
+    # Returns True when the active flags already carry their own port range so
+    # the external port-entry widget should be disabled.
+    ConflictManager.needs_ports_input(cmd) -> bool
 """
 
 from __future__ import annotations
@@ -76,6 +82,16 @@ class ConflictRule:
 
 _IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$")
 
+# Flags that embed their own port range — external port input must be disabled.
+_SELF_PORTING_FLAGS = {"-p-", "-F", "--top-ports"}
+
+# Flags that require raw sockets (need root/admin).
+_RAW_SOCKET_FLAGS = {"-sS", "-sU", "-O", "-f", "-sX", "-sF", "-sN", "-sA",
+                     "-sW", "-sI", "-sY", "-sO", "-PR"}
+
+# Flags that disable the port-scan phase entirely.
+_NO_PORT_SCAN_FLAGS = {"-sn"}
+
 
 def _is_ip_or_localhost(target: str) -> bool:
     return bool(_IP_RE.match(target)) or target.lower() in ("localhost", "127.0.0.1")
@@ -115,6 +131,25 @@ def _remove_tokens(cmd: _CMD, *tokens: str) -> _CMD:
     return [t for t in cmd if t not in tokens]
 
 
+def _has_script(cmd: _CMD, *fragments: str) -> bool:
+    """Return True if any --script token contains one of *fragments*."""
+    in_script = False
+    for tok in cmd:
+        if tok == "--script":
+            in_script = True
+            continue
+        if in_script:
+            if any(frag in tok for frag in fragments):
+                return True
+            in_script = False
+        # Also handle --script=value syntax
+        if tok.startswith("--script="):
+            val = tok[len("--script="):]
+            if any(frag in val for frag in fragments):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Rule declarations
 # ---------------------------------------------------------------------------
@@ -122,9 +157,6 @@ def _remove_tokens(cmd: _CMD, *tokens: str) -> _CMD:
 # Rules are kept in a single ordered list.  Auto-fix rules come first so the
 # cleaned command is available for subsequent warn-only checks.
 #
-_RAW_SOCKET_FLAGS = {"-sS", "-sU", "-O", "-f", "-sX", "-sF", "-sN", "-sA",
-                     "-sW", "-sI", "-sY", "-sO", "-PR"}
-
 DEFAULT_RULES: list[ConflictRule] = [
 
     # ── Auto-fix rules ───────────────────────────────────────────────────────
@@ -200,12 +232,59 @@ DEFAULT_RULES: list[ConflictRule] = [
         fix=lambda cmd: _remove_flags(cmd, "-sT"),
     ),
 
+    ConflictRule(
+        name="top_ports_with_p_flag",
+        # --top-ports N and -p <range> are mutually exclusive; nmap uses the
+        # last-specified, but it's almost always a mistake.  Drop --top-ports.
+        check=lambda cmd, target, ports, root: (
+            "--top-ports" in cmd and _has_flag(cmd, "-p", "-p-", "-F")
+        ),
+        severity="auto_fix",
+        message=lambda cmd, target, ports, root: (
+            "[!] AUTO-FIX: '--top-ports' and an explicit port range ('-p'/'-F'/'-p-') "
+            "are mutually exclusive.  '--top-ports' and its value have been removed; "
+            "the explicit port range will be used."
+        ),
+        fix=lambda cmd: _remove_flags(cmd, "--top-ports"),
+    ),
+
+    ConflictRule(
+        name="no_ping_with_ping_only",
+        # -Pn (skip host discovery) combined with -sn (host-discovery only) is
+        # contradictory.  Drop -Pn.
+        check=lambda cmd, target, ports, root: (
+            _has_flag(cmd, "-Pn") and _has_flag(cmd, "-sn")
+        ),
+        severity="auto_fix",
+        message=lambda cmd, target, ports, root: (
+            "[!] AUTO-FIX: '-Pn' (skip host discovery) combined with '-sn' "
+            "(host-discovery only scan) is contradictory.  '-Pn' has been removed."
+        ),
+        fix=lambda cmd: _remove_flags(cmd, "-Pn"),
+    ),
+
+    ConflictRule(
+        name="aggressive_subsumes_sv_sc_o",
+        # -A already implies -sV, -sC, and -O.  Having them separately is
+        # harmless but pollutes the command and confuses users.
+        check=lambda cmd, target, ports, root: (
+            _has_flag(cmd, "-A") and bool(_flags(cmd) & {"-sV", "-sC", "-O"})
+        ),
+        severity="auto_fix",
+        message=lambda cmd, target, ports, root: (
+            "[!] AUTO-FIX: '-A' already enables "
+            + ", ".join(sorted(_flags(cmd) & {"-sV", "-sC", "-O"}))
+            + ".  Redundant flags removed."
+        ),
+        fix=lambda cmd: _remove_flags(cmd, "-sV", "-sC", "-O"),
+    ),
+
     # ── Warn-only rules (advisory — no mutation) ─────────────────────────────
 
     ConflictRule(
         name="dns_brute_needs_domain",
         check=lambda cmd, target, ports, root: (
-            any("dns-brute" in t for t in cmd) and _is_ip_or_localhost(target)
+            _has_script(cmd, "dns-brute") and _is_ip_or_localhost(target)
         ),
         severity="warning",
         message=lambda cmd, target, ports, root: (
@@ -239,6 +318,19 @@ DEFAULT_RULES: list[ConflictRule] = [
             "[!] PERFORMANCE WARNING: '-sU -p-' (UDP scan of all 65 535 ports) is "
             "extremely slow and may take hours.  Consider limiting to the most "
             "common UDP ports with '--top-ports 200' instead."
+        ),
+    ),
+
+    ConflictRule(
+        name="udp_tcp_combined_slow",
+        check=lambda cmd, target, ports, root: (
+            _has_flag(cmd, "-sU") and _has_flag(cmd, "-sS", "-sT", "-sA", "-sW")
+        ),
+        severity="warning",
+        message=lambda cmd, target, ports, root: (
+            "[!] PERFORMANCE WARNING: Combining UDP scan ('-sU') with a TCP scan type "
+            "is significantly slower because nmap must run both scan phases.  Expect "
+            "the scan to take at least 2× as long."
         ),
     ),
 
@@ -296,9 +388,41 @@ DEFAULT_RULES: list[ConflictRule] = [
     ),
 
     ConflictRule(
+        name="script_needs_port_scan",
+        # NSE scripts that probe service-level ports (http-*, smb-*, ftp-*, ssh-*)
+        # are useless without a port-scan phase.  Warn if -sn is combined with them.
+        check=lambda cmd, target, ports, root: (
+            _has_flag(cmd, "-sn") and _has_script(cmd, "http-", "smb-", "ftp-", "ssh-",
+                                                   "mysql-", "ms-sql-", "rdp-", "irc-")
+        ),
+        severity="warning",
+        message=lambda cmd, target, ports, root: (
+            "[!] SCRIPT WARNING: Service-level NSE scripts (http-*, smb-*, ftp-*, …) "
+            "require open ports discovered by a port-scan phase.  '-sn' disables port "
+            "scanning so these scripts will not run.  Remove '-sn' or switch to a "
+            "service-probing scan type."
+        ),
+    ),
+
+    ConflictRule(
+        name="brute_needs_service_port",
+        # Brute-force scripts need a target port — if only -sn is set there's
+        # nothing to brute-force.
+        check=lambda cmd, target, ports, root: (
+            _has_script(cmd, "brute") and _has_flag(cmd, "-sn")
+        ),
+        severity="warning",
+        message=lambda cmd, target, ports, root: (
+            "[!] BRUTE-FORCE WARNING: Brute-force NSE scripts need a service port to "
+            "connect to.  '-sn' disables port scanning so no ports will be found and "
+            "the brute-force scripts will not execute."
+        ),
+    ),
+
+    ConflictRule(
         name="localhost_vuln_scan",
         check=lambda cmd, target, ports, root: (
-            any(s in cmd for s in ["vuln", "--script=vuln"])
+            _has_script(cmd, "vuln")
             and target in ("127.0.0.1", "localhost")
         ),
         severity="info",
@@ -312,13 +436,46 @@ DEFAULT_RULES: list[ConflictRule] = [
     ConflictRule(
         name="aggressive_timing_with_brute",
         check=lambda cmd, target, ports, root: (
-            _has_flag(cmd, "-T5") and any("brute" in t for t in cmd)
+            _has_flag(cmd, "-T5") and _has_script(cmd, "brute")
         ),
         severity="warning",
         message=lambda cmd, target, ports, root: (
             "[!] BRUTE-FORCE WARNING: '-T5' with brute-force NSE scripts causes "
             "very rapid login attempts that will almost certainly trigger account "
             "lockouts.  Use -T3 or lower for brute-force operations."
+        ),
+    ),
+
+    ConflictRule(
+        name="version_intensity_without_sv",
+        # --version-intensity is only meaningful when -sV is active.
+        check=lambda cmd, target, ports, root: (
+            "--version-intensity" in cmd and not _has_flag(cmd, "-sV", "-A")
+        ),
+        severity="warning",
+        message=lambda cmd, target, ports, root: (
+            "[!] CONFIGURATION WARNING: '--version-intensity' has no effect without "
+            "'-sV' or '-A'.  Add version detection or remove the flag."
+        ),
+    ),
+
+    ConflictRule(
+        name="min_rate_high_stealth",
+        # --min-rate with very high values defeats stealth scan strategies.
+        check=lambda cmd, target, ports, root: (
+            "--min-rate" in cmd
+            and _has_flag(cmd, "-sX", "-sN", "-sF")
+            and any(
+                tok.isdigit() and int(tok) > 500
+                for i, tok in enumerate(cmd)
+                if i > 0 and cmd[i - 1] == "--min-rate"
+            )
+        ),
+        severity="warning",
+        message=lambda cmd, target, ports, root: (
+            "[!] EVASION WARNING: '--min-rate' with a high value defeats the purpose "
+            "of stealth scan types (-sX/-sN/-sF) by generating easily detectable "
+            "traffic bursts.  Remove '--min-rate' or reduce it below 100 pps."
         ),
     ),
 
@@ -343,7 +500,7 @@ DEFAULT_RULES: list[ConflictRule] = [
     ConflictRule(
         name="brute_force_on_localhost_lockout_risk",
         check=lambda cmd, target, ports, root: (
-            any("brute" in t for t in cmd)
+            _has_script(cmd, "brute")
             and target in ("127.0.0.1", "localhost")
             and _has_flag(cmd, "-T4", "-T5")
         ),
@@ -427,3 +584,23 @@ class ConflictManager:
     def has_errors(messages: list[_INFO]) -> bool:
         """Return True if any *messages* entry has ``severity == "error"``."""
         return any(sev == "error" for sev, _ in messages)
+
+    @staticmethod
+    def needs_ports_input(cmd: list[str]) -> bool:
+        """Return True when the external port-entry widget should be *enabled*.
+
+        Port input must be **disabled** when:
+        - '-sn' (ping-only / no-port-scan) is present — ports are irrelevant.
+        - '-p-' is present — all 65 535 ports are already scanned.
+        - '-F'  is present — top-100 ports are already fixed.
+        - '--top-ports' is present — port count already embedded.
+
+        In all other cases the user should be allowed to specify a port range.
+        """
+        flags = set(cmd)
+        if flags & _NO_PORT_SCAN_FLAGS:
+            return False
+        if flags & _SELF_PORTING_FLAGS:
+            return False
+        return True
+

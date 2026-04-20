@@ -313,3 +313,147 @@ def test_has_errors_false_when_only_warnings() -> None:
 def test_has_errors_false_on_empty_messages() -> None:
     assert not ConflictManager.has_errors([])
 
+
+# ---------------------------------------------------------------------------
+# New auto-fix: --top-ports with explicit -p conflicts
+# ---------------------------------------------------------------------------
+
+def test_top_ports_with_p_flag_removes_top_ports() -> None:
+    cmd = ["nmap", "--top-ports", "1000", "-p", "80,443", "target"]
+    clean, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert "--top-ports" not in clean
+    assert any("top-ports" in m.lower() for m in _msgs(msgs))
+
+
+def test_top_ports_alone_no_conflict() -> None:
+    cmd = ["nmap", "--top-ports", "1000", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    tp_msgs = [m for m in _msgs(msgs) if "top-ports" in m.lower() and "auto" in m.lower()]
+    assert not tp_msgs
+
+
+# ---------------------------------------------------------------------------
+# New auto-fix: -Pn + -sn contradiction
+# ---------------------------------------------------------------------------
+
+def test_pn_with_sn_removes_pn() -> None:
+    cmd = ["nmap", "-Pn", "-sn", "target"]
+    clean, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert "-Pn" not in clean
+    assert any("-Pn" in m or "contradictory" in m.lower() for m in _msgs(msgs))
+
+
+def test_pn_without_sn_no_conflict() -> None:
+    cmd = ["nmap", "-Pn", "-sS", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    pn_msgs = [m for m in _msgs(msgs) if "-Pn" in m and "auto" in m.lower()]
+    assert not pn_msgs
+
+
+# ---------------------------------------------------------------------------
+# New auto-fix: -A subsumes -sV / -sC / -O
+# ---------------------------------------------------------------------------
+
+def test_aggressive_removes_sv_sc_o() -> None:
+    cmd = ["nmap", "-A", "-sV", "-sC", "-O", "target"]
+    clean, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert "-sV" not in clean
+    assert "-sC" not in clean
+    assert "-O"  not in clean
+    assert any("auto_fix" in sev for sev in _severities(msgs))
+
+
+def test_aggressive_alone_no_subsume_conflict() -> None:
+    cmd = ["nmap", "-A", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    # The subsume rule should NOT fire if -sV/-sC/-O aren't also present
+    subsume_msgs = [m for m in _msgs(msgs) if "redundant" in m.lower()]
+    assert not subsume_msgs
+
+
+# ---------------------------------------------------------------------------
+# New warn: UDP + TCP combined is slow
+# ---------------------------------------------------------------------------
+
+def test_udp_plus_tcp_combined_warns() -> None:
+    cmd = ["nmap", "-sU", "-sS", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert any("slow" in m.lower() or "2×" in m for m in _msgs(msgs))
+
+
+# ---------------------------------------------------------------------------
+# New warn: service scripts need port scan, not -sn
+# ---------------------------------------------------------------------------
+
+def test_http_script_with_sn_warns() -> None:
+    cmd = ["nmap", "-sn", "--script", "http-title", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert any("http" in m.lower() or "service-level" in m.lower() for m in _msgs(msgs))
+
+
+def test_http_script_without_sn_no_warn() -> None:
+    cmd = ["nmap", "--script", "http-title", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    sn_service_msgs = [m for m in _msgs(msgs) if "service-level" in m.lower()]
+    assert not sn_service_msgs
+
+
+# ---------------------------------------------------------------------------
+# New warn: brute script needs port scan
+# ---------------------------------------------------------------------------
+
+def test_brute_script_with_sn_warns() -> None:
+    cmd = ["nmap", "-sn", "--script", "ftp-brute", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert any("brute" in m.lower() and "port" in m.lower() for m in _msgs(msgs))
+
+
+# ---------------------------------------------------------------------------
+# New warn: --version-intensity without -sV or -A
+# ---------------------------------------------------------------------------
+
+def test_version_intensity_without_sv_warns() -> None:
+    cmd = ["nmap", "--version-intensity", "9", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert any("version-intensity" in m.lower() for m in _msgs(msgs))
+
+
+def test_version_intensity_with_sv_no_warn() -> None:
+    cmd = ["nmap", "-sV", "--version-intensity", "9", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    vi_msgs = [m for m in _msgs(msgs) if "version-intensity" in m.lower()]
+    assert not vi_msgs
+
+
+# ---------------------------------------------------------------------------
+# needs_ports_input static helper
+# ---------------------------------------------------------------------------
+
+def test_needs_ports_input_bare_nmap() -> None:
+    assert ConflictManager.needs_ports_input(["nmap", "target"]) is True
+
+
+def test_needs_ports_input_sn_disables() -> None:
+    assert ConflictManager.needs_ports_input(["nmap", "-sn", "target"]) is False
+
+
+def test_needs_ports_input_p_minus_disables() -> None:
+    assert ConflictManager.needs_ports_input(["nmap", "-p-", "target"]) is False
+
+
+def test_needs_ports_input_F_disables() -> None:
+    assert ConflictManager.needs_ports_input(["nmap", "-F", "target"]) is False
+
+
+def test_needs_ports_input_top_ports_disables() -> None:
+    assert ConflictManager.needs_ports_input(["nmap", "--top-ports", "1000", "target"]) is False
+
+
+def test_needs_ports_input_sS_T4_enabled() -> None:
+    assert ConflictManager.needs_ports_input(["nmap", "-sS", "-T4", "target"]) is True
+
+
+def test_needs_ports_input_sV_enabled() -> None:
+    assert ConflictManager.needs_ports_input(["nmap", "-sV", "-p", "80,443", "target"]) is True
+
+
