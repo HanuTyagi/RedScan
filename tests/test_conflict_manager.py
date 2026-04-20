@@ -250,3 +250,66 @@ def test_custom_rules_override_defaults() -> None:
     clean, msgs = custom_cm.apply(cmd, "127.0.0.1", "1-1024", is_root=False)
     assert msgs == []
     assert clean == cmd
+
+
+# ---------------------------------------------------------------------------
+# Error severity: idle scan placeholder zombie host
+# ---------------------------------------------------------------------------
+
+def test_idle_scan_with_placeholder_zombie_is_error() -> None:
+    cmd = ["nmap", "-sI", "zombie_host", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert any(sev == "error" for sev, _ in msgs)
+    error_texts = [text for sev, text in msgs if sev == "error"]
+    assert any("zombie" in t.lower() or "placeholder" in t.lower() for t in error_texts)
+
+
+def test_idle_scan_with_real_zombie_no_error() -> None:
+    cmd = ["nmap", "-sI", "192.168.1.50", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert not any(sev == "error" for sev, _ in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Error severity: brute-force on localhost with aggressive timing
+# ---------------------------------------------------------------------------
+
+def test_brute_force_localhost_t4_is_error() -> None:
+    cmd = ["nmap", "--script", "ssh-brute", "-T4", "127.0.0.1"]
+    _, msgs = cm.apply(cmd, "127.0.0.1", "", is_root=True)
+    assert any(sev == "error" for sev, _ in msgs)
+
+
+def test_brute_force_localhost_t3_not_error() -> None:
+    # -T3 is acceptable
+    cmd = ["nmap", "--script", "ssh-brute", "-T3", "127.0.0.1"]
+    _, msgs = cm.apply(cmd, "127.0.0.1", "", is_root=True)
+    assert not any(sev == "error" for sev, _ in msgs)
+
+
+def test_brute_force_remote_t4_not_error() -> None:
+    # remote target — not an error (only a warning from aggressive_timing_with_brute)
+    cmd = ["nmap", "--script", "ssh-brute", "-T4", "192.168.1.1"]
+    _, msgs = cm.apply(cmd, "192.168.1.1", "", is_root=True)
+    assert not any(sev == "error" for sev, _ in msgs)
+
+
+# ---------------------------------------------------------------------------
+# ConflictManager.has_errors helper
+# ---------------------------------------------------------------------------
+
+def test_has_errors_true_when_error_present() -> None:
+    cmd = ["nmap", "-sI", "zombie_host", "target"]
+    _, msgs = cm.apply(cmd, "target", "", is_root=True)
+    assert ConflictManager.has_errors(msgs)
+
+
+def test_has_errors_false_when_only_warnings() -> None:
+    cmd = ["nmap", "-sS", "-T4", "192.168.1.1"]
+    _, msgs = cm.apply(cmd, "192.168.1.1", "", is_root=False)
+    assert not ConflictManager.has_errors(msgs)
+
+
+def test_has_errors_false_on_empty_messages() -> None:
+    assert not ConflictManager.has_errors([])
+

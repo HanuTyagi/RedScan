@@ -9,6 +9,7 @@ sent directly to the dashboard (run now) or saved as a preset.
 """
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from typing import Callable
 
@@ -19,7 +20,11 @@ from gui.styles import (
     CARD_CORNER, FONT_BODY, FONT_H1, FONT_H2, FONT_MONO, FONT_SMALL, PAD,
     PAD_S, TEXT_MUTED, TEXT_PRIMARY,
 )
+from redscan.conflict_manager import ConflictManager
 from redscan.preset_library import ScanPreset
+
+# Shared, stateless conflict manager instance
+_factory_conflict_manager = ConflictManager()
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +149,7 @@ class CommandFactoryView(ctk.CTkFrame):
         # Placed pieces: list of _FlagPieceData
         self._placed: list[_FlagPieceData] = []
         self._target_var = tk.StringVar(value="192.168.1.1")
+        self._target_var.trace_add("write", lambda *_: self._update_preview())
 
         self._build()
 
@@ -231,6 +237,27 @@ class CommandFactoryView(ctk.CTkFrame):
             anchor="w",
         )
         self._cmd_label.pack(side="left", fill="x", expand=True)
+
+        # ── Conflict warning bar (hidden when there are no conflicts) ─────────
+        self._conflict_bar = ctk.CTkFrame(
+            bottom,
+            fg_color="#2a1a0a",
+            corner_radius=6,
+            border_width=1,
+            border_color="#8a4a0a",
+        )
+        # Not packed yet — shown only when conflicts exist.
+
+        self._conflict_text = ctk.CTkLabel(
+            self._conflict_bar,
+            text="",
+            font=FONT_SMALL,
+            text_color="#ffcc88",
+            wraplength=800,
+            justify="left",
+            anchor="w",
+        )
+        self._conflict_text.pack(fill="x", padx=PAD_S, pady=PAD_S)
 
         btn_row = ctk.CTkFrame(bottom, fg_color="transparent")
         btn_row.pack(fill="x", padx=PAD, pady=(0, PAD))
@@ -402,6 +429,55 @@ class CommandFactoryView(ctk.CTkFrame):
         target = self._target_var.get().strip() or "<target>"
         parts.append(target)
         self._cmd_var.set(" ".join(parts))
+        self._refresh_conflict_bar(parts, target)
+
+    def _refresh_conflict_bar(self, cmd: list[str], target: str) -> None:
+        """Run the conflict manager against the current command and update the
+        warning bar.  The bar is shown only when there is at least one message;
+        it is hidden (not packed) when the command is clean."""
+        if not self._placed:
+            self._conflict_bar.pack_forget()
+            return
+
+        try:
+            is_root = os.geteuid() == 0
+        except AttributeError:
+            is_root = True  # Windows
+
+        _, messages = _factory_conflict_manager.apply(cmd, target, "", is_root)
+        if not messages:
+            self._conflict_bar.pack_forget()
+            return
+
+        # Pick bar colour by worst severity (error > warning > auto_fix > info)
+        severity_order = {"error": 0, "warning": 1, "auto_fix": 2, "info": 3}
+        worst = min(messages, key=lambda m: severity_order.get(m[0], 99))[0]
+        bar_colors = {
+            "error":    ("#2a0a0a", "#aa2a2a"),
+            "warning":  ("#2a1a0a", "#8a4a0a"),
+            "auto_fix": ("#0a1a2a", "#2a6aaa"),
+            "info":     ("#0a1a0a", "#2a6a2a"),
+        }
+        text_colors = {
+            "error":    "#ffaaaa",
+            "warning":  "#ffcc88",
+            "auto_fix": "#88ccff",
+            "info":     "#aaffaa",
+        }
+        fg, border = bar_colors.get(worst, ("#1a1a1a", "#444"))
+        tc = text_colors.get(worst, "#cccccc")
+        self._conflict_bar.configure(fg_color=fg, border_color=border)
+        self._conflict_text.configure(text_color=tc)
+
+        lines = [
+            f"{'⛔' if sev == 'error' else '⚠' if sev == 'warning' else '🔧' if sev == 'auto_fix' else 'ℹ'}  {text}"
+            for sev, text in messages
+        ]
+        self._conflict_text.configure(text="\n".join(lines))
+        # Pack just before the btn_row if not already visible
+        self._conflict_bar.pack(fill="x", padx=PAD, pady=(0, PAD_S))
+        # Ensure btn_row stays below by lifting it
+        self._conflict_bar.lift()
 
     def get_command(self) -> str:
         self._update_preview()

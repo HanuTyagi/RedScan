@@ -35,7 +35,7 @@ from typing import Callable, Literal
 # Types
 # ---------------------------------------------------------------------------
 
-Severity = Literal["auto_fix", "warning", "info"]
+Severity = Literal["auto_fix", "error", "warning", "info"]
 
 _CMD  = list[str]
 _INFO = tuple[Severity, str]
@@ -54,6 +54,7 @@ class ConflictRule:
         Returns True when the conflict is present.
     severity:
         "auto_fix"  – mutate the command and log an advisory.
+        "error"     – do NOT mutate; block the scan and show a blocking dialog.
         "warning"   – log a warning but do not mutate.
         "info"      – log a neutral note.
     fix:
@@ -320,6 +321,39 @@ DEFAULT_RULES: list[ConflictRule] = [
             "lockouts.  Use -T3 or lower for brute-force operations."
         ),
     ),
+
+    # ── Error rules (scan is blocked until the user corrects the command) ────
+
+    ConflictRule(
+        name="idle_scan_placeholder_zombie",
+        check=lambda cmd, target, ports, root: (
+            _has_flag(cmd, "-sI") and any(
+                t in ("zombie_host", "zombie", "<zombie>", "ZOMBIE_HOST")
+                for t in cmd
+            )
+        ),
+        severity="error",
+        message=lambda cmd, target, ports, root: (
+            "[✖] ERROR: Idle scan ('-sI') requires a real zombie host IP but the "
+            "placeholder value was not replaced.  Update the command with a real "
+            "zombie host before running."
+        ),
+    ),
+
+    ConflictRule(
+        name="brute_force_on_localhost_lockout_risk",
+        check=lambda cmd, target, ports, root: (
+            any("brute" in t for t in cmd)
+            and target in ("127.0.0.1", "localhost")
+            and _has_flag(cmd, "-T4", "-T5")
+        ),
+        severity="error",
+        message=lambda cmd, target, ports, root: (
+            "[✖] ERROR: Running brute-force NSE scripts against localhost with "
+            "aggressive timing (-T4/-T5) is very likely to lock out local system "
+            "accounts.  Switch to -T3 or lower, or choose a non-localhost target."
+        ),
+    ),
 ]
 
 
@@ -365,6 +399,9 @@ class ConflictManager:
         -------
         clean_cmd:
             Possibly modified command list with auto-fixes applied.
+            *Note*: if any ``error``-severity rule fires, the command is
+            returned unchanged — callers should inspect the messages and block
+            the scan.
         messages:
             List of ``(severity, text)`` tuples for every triggered rule.
         """
@@ -385,3 +422,8 @@ class ConflictManager:
                     clean_cmd = list(rule.fix(clean_cmd))
 
         return clean_cmd, messages
+
+    @staticmethod
+    def has_errors(messages: list[_INFO]) -> bool:
+        """Return True if any *messages* entry has ``severity == "error"``."""
+        return any(sev == "error" for sev, _ in messages)

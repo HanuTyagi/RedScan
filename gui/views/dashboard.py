@@ -37,7 +37,7 @@ from gui.styles import (
     TEXT_DANGER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SUCCESS,
 )
 from redscan.preset_library import PRESET_CATALOGUE, get_by_key
-from redscan.conflict_manager import ConflictManager
+from redscan.conflict_manager import ConflictManager, _INFO as _ConflictInfo
 
 _OPEN_PORT_RE = re.compile(r"(?P<port>\d+)/(?P<proto>tcp|udp)\s+open\s+(?P<service>\S+)(?:\s+(?P<version>.*))?")
 _HOST_RE = re.compile(r"Nmap scan report for (.+)")
@@ -389,13 +389,19 @@ class DashboardView(ctk.CTkFrame):
         except OSError:
             return None
 
-    def _log_preflight_warnings(self, cmd: list[str]) -> list[str]:
+    def _log_preflight_warnings(self, cmd: list[str]) -> tuple[list[str], list[_ConflictInfo]]:
         """Run the dynamic conflict manager against *cmd*.
 
         Auto-fix rules mutate the command (e.g. remove -sV when -sn is set);
-        warn-only rules emit advisory messages to the log.
+        warn-only rules emit advisory messages to the log;
+        error rules emit a message but do NOT mutate — the caller must gate
+        the scan start on the returned message list.
 
-        Returns the (possibly modified) command list.
+        Returns
+        -------
+        (clean_cmd, messages)
+            ``clean_cmd`` – the possibly-modified command list.
+            ``messages``  – all (severity, text) pairs from triggered rules.
         """
         target = self._target_var.get().strip()
         ports_str = self._ports_var.get().strip()
@@ -409,7 +415,7 @@ class DashboardView(ctk.CTkFrame):
         for severity, text in messages:
             self._log(text + "\n")
 
-        return clean_cmd
+        return clean_cmd, messages
 
     def _start_scan(self) -> None:
         if self._running:
@@ -422,8 +428,22 @@ class DashboardView(ctk.CTkFrame):
         self._run_btn.configure(state="disabled")
 
         cmd = self._build_command()
-        # Run the conflict manager: auto-fix rules may return a cleaned cmd.
-        cmd = self._log_preflight_warnings(cmd)
+        # Run the conflict manager: auto-fix rules may return a cleaned cmd;
+        # error-level rules block the scan entirely.
+        cmd, preflight_msgs = self._log_preflight_warnings(cmd)
+        if ConflictManager.has_errors(preflight_msgs):
+            error_texts = [
+                text for sev, text in preflight_msgs if sev == "error"
+            ]
+            self._running = False
+            self._run_btn.configure(state="normal")
+            self._status_var.set("Scan blocked — fix errors first.")
+            _error_dialog(
+                self,
+                "Scan Blocked — Error Detected",
+                "\n\n".join(error_texts),
+            )
+            return
         self._command_used = " ".join(cmd)
         self._log(f"[*] Starting scan: {self._command_used}\n")
         self._status_var.set("Scanning…")
@@ -866,3 +886,46 @@ class DashboardView(ctk.CTkFrame):
             f"Smart Scan: {len(self._hosts)} host(s), "
             f"{len(endpoints)} open port(s) discovered"
         )
+
+
+# ---------------------------------------------------------------------------
+# Module-level helper dialogs
+# ---------------------------------------------------------------------------
+
+def _error_dialog(parent: ctk.CTkFrame, title: str, message: str) -> None:
+    """Show a blocking error dialog that cannot be dismissed accidentally.
+
+    Uses a red accent colour to distinguish it from informational dialogs.
+    """
+    from gui.styles import FONT_SMALL, PAD
+    import customtkinter as _ctk
+
+    dlg = _ctk.CTkToplevel(parent)
+    dlg.title(title)
+    dlg.geometry("480x200")
+    dlg.grab_set()
+    dlg.configure(fg_color="#1a0a0a")
+
+    _ctk.CTkLabel(
+        dlg,
+        text="⛔  " + title,
+        font=("Segoe UI", 13, "bold"),
+        text_color="#e94560",
+    ).pack(padx=PAD, pady=(PAD, 0), anchor="w")
+
+    _ctk.CTkLabel(
+        dlg,
+        text=message,
+        font=FONT_SMALL,
+        text_color="#ffbbbb",
+        wraplength=440,
+        justify="left",
+    ).pack(padx=PAD, pady=PAD, fill="x")
+
+    _ctk.CTkButton(
+        dlg,
+        text="Dismiss",
+        fg_color="#5a1a1a",
+        hover_color="#8a2a2a",
+        command=dlg.destroy,
+    ).pack(pady=(0, PAD))
