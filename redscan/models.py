@@ -10,6 +10,9 @@ class Endpoint(BaseModel):
     port: int = Field(ge=1, le=65535)
 
 
+ProbeType = Literal["tcp_connect", "udp", "icmp", "tcp_syn"]
+
+
 class ProbeResult(BaseModel):
     endpoint: Endpoint
     status: Literal["open", "closed", "timeout", "error"]
@@ -39,6 +42,13 @@ class DiscoveryConfig(BaseModel):
     # high baseline that allows the scanner to run too fast before it has
     # meaningful RTT data.
     rtt_base_warmup_samples: int = Field(default=5, ge=1)
+    # Probe-type selection.  tcp_connect works without root; udp/icmp/tcp_syn
+    # require elevated privileges on most operating systems.
+    probe_type: ProbeType = "tcp_connect"
+    # When True the engine attempts to split probe packets into small IP
+    # fragments (evasion technique).  Silently ignored for tcp_connect / icmp
+    # probe types and when running without root.
+    fragmented: bool = False
 
 
 class DiscoveryStats(BaseModel):

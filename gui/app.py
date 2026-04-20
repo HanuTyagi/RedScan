@@ -104,6 +104,7 @@ class RedScanApp(ctk.CTk):
         self._smart_scan = SmartScanView(
             self._content,
             on_hosts_discovered=self._on_smart_scan_results,
+            on_run_nmap_command=self._on_smart_scan_nmap,
         )
         self._llm_panel = LLMInsightsView(self._content)
 
@@ -224,6 +225,11 @@ class RedScanApp(ctk.CTk):
         """Dashboard: open AI Insights with the current scan context."""
         self._llm_panel.load_context(hosts, command)
         self._show_view("llm")
+
+    def _on_smart_scan_nmap(self, command: str) -> None:
+        """Smart Scan breakpoint: run the user-configured nmap command on the Dashboard."""
+        self._show_view("dashboard")
+        self._dashboard.run_custom_command(command)
 
     def _on_smart_scan_results(self, results: list[dict[str, Any]], rate: float) -> None:
         """Smart Scan: populate the Dashboard with discovered endpoints and navigate to it."""

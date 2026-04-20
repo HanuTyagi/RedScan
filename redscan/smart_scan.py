@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import socket as _socket
+import subprocess
 import time
 from collections import deque
+from typing import Callable
 
 from .models import DiscoveryConfig, DiscoveryOutput, DiscoveryStats, Endpoint, ProbeResult
 
@@ -104,6 +108,28 @@ class SmartScanModule:
         self.controller = AdaptiveRateController(self.cfg)
 
     async def _probe(self, endpoint: Endpoint) -> ProbeResult:
+        """Dispatch to the probe implementation selected by cfg.probe_type."""
+        pt = self.cfg.probe_type
+        if pt == "udp":
+            return await self._probe_udp(endpoint)
+        if pt == "icmp":
+            return await self._probe_icmp(endpoint)
+        if pt == "tcp_syn":
+            # TCP SYN half-open scan requires raw sockets (root).
+            # Fall back to tcp_connect if the caller is unprivileged.
+            try:
+                if os.geteuid() != 0:
+                    return await self._probe_tcp_connect(endpoint)
+            except AttributeError:
+                pass  # Windows — getuid unavailable; attempt raw probe
+            # Raw SYN not implemented without scapy; use tcp_connect.
+            return await self._probe_tcp_connect(endpoint)
+        return await self._probe_tcp_connect(endpoint)
+
+    # ── Probe implementations ─────────────────────────────────────────────────
+
+    async def _probe_tcp_connect(self, endpoint: Endpoint) -> ProbeResult:
+        """Standard full-handshake TCP connect probe (works without root)."""
         start = time.perf_counter()
         writer = None
         try:
@@ -131,7 +157,76 @@ class SmartScanModule:
                 with contextlib.suppress(Exception):
                     await writer.wait_closed()
 
-    async def discovery_pass(self, endpoints: list[Endpoint]) -> DiscoveryOutput:
+    async def _probe_udp(self, endpoint: Endpoint) -> ProbeResult:
+        """UDP probe: sends a short datagram and waits for a reply or ICMP error."""
+        loop = asyncio.get_event_loop()
+        try:
+            result: ProbeResult = await asyncio.wait_for(
+                loop.run_in_executor(None, self._udp_probe_sync, endpoint),
+                timeout=self.cfg.connect_timeout_s + 1.0,
+            )
+            return result
+        except asyncio.TimeoutError:
+            return ProbeResult(endpoint=endpoint, status="timeout")
+
+    def _udp_probe_sync(self, endpoint: Endpoint) -> ProbeResult:
+        start = time.perf_counter()
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.settimeout(self.cfg.connect_timeout_s)
+        try:
+            sock.connect((endpoint.host, endpoint.port))
+            sock.send(b"\x00" * 4)
+            try:
+                sock.recv(64)
+                rtt_ms = (time.perf_counter() - start) * 1000.0
+                return ProbeResult(endpoint=endpoint, status="open", rtt_ms=rtt_ms)
+            except _socket.timeout:
+                # No ICMP port-unreachable within timeout → open|filtered.
+                rtt_ms = (time.perf_counter() - start) * 1000.0
+                return ProbeResult(endpoint=endpoint, status="open", rtt_ms=rtt_ms)
+        except ConnectionRefusedError:
+            # ICMP port-unreachable received → port closed.
+            rtt_ms = (time.perf_counter() - start) * 1000.0
+            return ProbeResult(endpoint=endpoint, status="closed", rtt_ms=rtt_ms)
+        except _socket.error as exc:
+            return ProbeResult(endpoint=endpoint, status="error", error=str(exc))
+        finally:
+            sock.close()
+
+    async def _probe_icmp(self, endpoint: Endpoint) -> ProbeResult:
+        """ICMP echo probe: uses subprocess ping (works without scapy)."""
+        loop = asyncio.get_event_loop()
+        try:
+            result: ProbeResult = await asyncio.wait_for(
+                loop.run_in_executor(None, self._icmp_probe_sync, endpoint),
+                timeout=self.cfg.connect_timeout_s * 4 + 2.0,
+            )
+            return result
+        except asyncio.TimeoutError:
+            return ProbeResult(endpoint=endpoint, status="timeout")
+
+    def _icmp_probe_sync(self, endpoint: Endpoint) -> ProbeResult:
+        start = time.perf_counter()
+        try:
+            if os.name == "nt":
+                cmd = ["ping", "-n", "1", "-w", "1000", endpoint.host]
+            else:
+                cmd = ["ping", "-c", "1", "-W", "1", endpoint.host]
+            res = subprocess.run(cmd, capture_output=True, timeout=5)
+            rtt_ms = (time.perf_counter() - start) * 1000.0
+            if res.returncode == 0:
+                return ProbeResult(endpoint=endpoint, status="open", rtt_ms=rtt_ms)
+            return ProbeResult(endpoint=endpoint, status="closed", rtt_ms=rtt_ms)
+        except Exception as exc:
+            return ProbeResult(endpoint=endpoint, status="error", error=str(exc))
+
+    # ── Scan pass ─────────────────────────────────────────────────────────────
+
+    async def discovery_pass(
+        self,
+        endpoints: list[Endpoint],
+        per_probe_callback: Callable[[ProbeResult, bool], None] | None = None,
+    ) -> DiscoveryOutput:
         if not endpoints:
             return DiscoveryOutput(
                 open_endpoints=[],
@@ -190,6 +285,8 @@ class SmartScanModule:
                 for task in done:
                     result = task.result()
                     is_calibration_task = in_flight.pop(task, False)
+                    if per_probe_callback is not None:
+                        per_probe_callback(result, is_calibration_task)
                     if is_calibration_task:
                         if result.status in ("open", "closed") and result.rtt_ms is not None:
                             # Accept RST (closed) replies as valid RTT samples.  Some
