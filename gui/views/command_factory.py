@@ -255,7 +255,7 @@ class CommandFactoryView(ctk.CTkFrame):
     _PIECE_W = 200
     _PAD_X   = 10
     _PAD_Y   = 8
-    # Number of animation steps for the fade-in highlight
+    # Fade-in highlight animation: 8 steps × 50 ms = 400 ms total duration.
     _ANIM_STEPS = 8
     _ANIM_DELAY = 50   # ms per step
 
