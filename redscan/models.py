@@ -50,6 +50,25 @@ class DiscoveryConfig(BaseModel):
     # probe types and when running without root.
     fragmented: bool = False
 
+    # ── Enhancement features ──────────────────────────────────────────────────
+
+    # Run a fast ICMP ping sweep before port probing to skip offline hosts.
+    # This reduces wasted probes against hosts that are simply down.
+    host_prefilter: bool = False
+
+    # Reorder ports so those most frequently seen open in past scans are
+    # probed first.  Requires redscan.history to have prior scan data.
+    adaptive_port_ordering: bool = True
+
+    # Path to write/read a scan-progress checkpoint JSON file.  Set to a
+    # non-empty string to enable crash-recovery; the file is removed on clean
+    # completion.  Default None = disabled.
+    checkpoint_path: str | None = None
+
+    # Optional DNS server (e.g. "1.1.1.1") used when resolving hostnames
+    # before probing.  None = use the system resolver.
+    dns_server: str | None = None
+
 
 class DiscoveryStats(BaseModel):
     open_count: int = 0

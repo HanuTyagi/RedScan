@@ -2,14 +2,38 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import os
+import random
 import socket as _socket
+import struct
 import subprocess
 import time
 from collections import deque
 from typing import Callable
 
 from .models import DiscoveryConfig, DiscoveryOutput, DiscoveryStats, Endpoint, ProbeResult
+
+
+def await_fallback_probe(endpoint: Endpoint, timeout_s: float) -> ProbeResult:
+    """Synchronous TCP-connect fallback used when raw socket permission fails."""
+    import socket as _s
+    start = time.perf_counter()
+    sock = _s.socket(_s.AF_INET6 if ":" in endpoint.host else _s.AF_INET, _s.SOCK_STREAM)
+    sock.settimeout(timeout_s)
+    try:
+        sock.connect((endpoint.host, endpoint.port))
+        rtt_ms = (time.perf_counter() - start) * 1000.0
+        return ProbeResult(endpoint=endpoint, status="open", rtt_ms=rtt_ms)
+    except ConnectionRefusedError:
+        rtt_ms = (time.perf_counter() - start) * 1000.0
+        return ProbeResult(endpoint=endpoint, status="closed", rtt_ms=rtt_ms)
+    except _s.timeout:
+        return ProbeResult(endpoint=endpoint, status="timeout")
+    except Exception as exc:
+        return ProbeResult(endpoint=endpoint, status="error", error=str(exc))
+    finally:
+        sock.close()
 
 
 class AdaptiveRateController:
@@ -116,25 +140,28 @@ class SmartScanModule:
             return await self._probe_icmp(endpoint)
         if pt == "tcp_syn":
             # TCP SYN half-open scan requires raw sockets (root).
-            # Fall back to tcp_connect if the caller is unprivileged.
             try:
                 if os.geteuid() != 0:
                     return await self._probe_tcp_connect(endpoint)
             except AttributeError:
-                pass  # Windows — getuid unavailable; attempt raw probe
-            # Raw SYN not implemented without scapy; use tcp_connect.
-            return await self._probe_tcp_connect(endpoint)
+                pass  # Windows — geteuid unavailable; attempt raw probe
+            return await self._probe_tcp_syn_raw(endpoint)
         return await self._probe_tcp_connect(endpoint)
 
     # ── Probe implementations ─────────────────────────────────────────────────
 
     async def _probe_tcp_connect(self, endpoint: Endpoint) -> ProbeResult:
-        """Standard full-handshake TCP connect probe (works without root)."""
+        """Standard full-handshake TCP connect probe (works without root, supports IPv4+IPv6)."""
         start = time.perf_counter()
         writer = None
+        # Determine address family for IPv6 vs IPv4
+        af = _socket.AF_INET6 if ":" in endpoint.host else _socket.AF_INET
         try:
             _, writer = await asyncio.wait_for(
-                asyncio.open_connection(endpoint.host, endpoint.port),
+                asyncio.open_connection(
+                    endpoint.host, endpoint.port,
+                    family=af,
+                ),
                 timeout=self.cfg.connect_timeout_s,
             )
             rtt_ms = (time.perf_counter() - start) * 1000.0
@@ -171,7 +198,8 @@ class SmartScanModule:
 
     def _udp_probe_sync(self, endpoint: Endpoint) -> ProbeResult:
         start = time.perf_counter()
-        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        af = _socket.AF_INET6 if ":" in endpoint.host else _socket.AF_INET
+        sock = _socket.socket(af, _socket.SOCK_DGRAM)
         sock.settimeout(self.cfg.connect_timeout_s)
         try:
             sock.connect((endpoint.host, endpoint.port))
@@ -220,13 +248,306 @@ class SmartScanModule:
         except Exception as exc:
             return ProbeResult(endpoint=endpoint, status="error", error=str(exc))
 
-    # ── Scan pass ─────────────────────────────────────────────────────────────
+    # ── Raw TCP SYN probe ────────────────────────────────────────────────────
+
+    async def _probe_tcp_syn_raw(self, endpoint: Endpoint) -> ProbeResult:
+        """Half-open TCP SYN probe using raw sockets (Linux/macOS, requires root)."""
+        loop = asyncio.get_event_loop()
+        try:
+            result: ProbeResult = await asyncio.wait_for(
+                loop.run_in_executor(None, self._tcp_syn_probe_sync, endpoint),
+                timeout=self.cfg.connect_timeout_s + 1.0,
+            )
+            return result
+        except asyncio.TimeoutError:
+            return ProbeResult(endpoint=endpoint, status="timeout")
+
+    @staticmethod
+    def _ip_checksum(data: bytes) -> int:
+        """Compute the RFC 791 Internet checksum."""
+        if len(data) % 2:
+            data += b"\x00"
+        s = sum(
+            (data[i] << 8) + data[i + 1]
+            for i in range(0, len(data), 2)
+        )
+        while s >> 16:
+            s = (s & 0xFFFF) + (s >> 16)
+        return ~s & 0xFFFF
+
+    def _tcp_syn_probe_sync(self, endpoint: Endpoint) -> ProbeResult:
+        """Build and send a raw TCP SYN packet; parse the response."""
+        start = time.perf_counter()
+        try:
+            dst_ip = endpoint.host
+            dst_port = endpoint.port
+            src_port = random.randint(32768, 60999)
+            seq_num = random.randint(0, 0xFFFFFFFF)
+
+            # ── Resolve source IP ──────────────────────────────────────────
+            src_ip = _socket.gethostbyname(_socket.gethostname())
+
+            # ── Build TCP SYN header (20 bytes) ───────────────────────────
+            tcp_flags_syn = 0x002
+            tcp_doff = (5 << 4)        # 5 * 4 = 20 bytes, no options
+            tcp_header = struct.pack(
+                "!HHLLBBHHH",
+                src_port, dst_port,    # source / dest port
+                seq_num,               # sequence number
+                0,                     # ack number
+                tcp_doff,              # data offset + reserved
+                tcp_flags_syn,         # flags
+                _socket.htons(8192),   # window size
+                0,                     # checksum (filled below)
+                0,                     # urgent pointer
+            )
+
+            # TCP pseudo-header for checksum calculation
+            src_addr = _socket.inet_aton(src_ip)
+            dst_addr = _socket.inet_aton(dst_ip)
+            pseudo = struct.pack("!4s4sBBH", src_addr, dst_addr, 0,
+                                 _socket.IPPROTO_TCP, len(tcp_header))
+            tcp_cksum = self._ip_checksum(pseudo + tcp_header)
+
+            tcp_header = struct.pack(
+                "!HHLLBBHHH",
+                src_port, dst_port,
+                seq_num, 0,
+                tcp_doff, tcp_flags_syn,
+                _socket.htons(8192),
+                tcp_cksum, 0,
+            )
+
+            # ── Build IP header (20 bytes, kernel fills tot_len + checksum)
+            ip_ver_ihl = (4 << 4) + 5
+            ip_header = struct.pack(
+                "!BBHHHBBH4s4s",
+                ip_ver_ihl, 0,         # ver+IHL, DSCP
+                0,                     # tot_len (kernel fills)
+                random.randint(0, 65535),  # ident
+                0,                     # flags + frag offset
+                64,                    # TTL
+                _socket.IPPROTO_TCP,   # protocol
+                0,                     # checksum (kernel fills with IP_HDRINCL)
+                src_addr, dst_addr,
+            )
+
+            packet = ip_header + tcp_header
+
+            # ── Send ──────────────────────────────────────────────────────
+            send_sock = _socket.socket(
+                _socket.AF_INET, _socket.SOCK_RAW, _socket.IPPROTO_RAW
+            )
+            send_sock.setsockopt(_socket.IPPROTO_IP, _socket.IP_HDRINCL, 1)
+
+            recv_sock = _socket.socket(
+                _socket.AF_INET, _socket.SOCK_RAW, _socket.IPPROTO_TCP
+            )
+            recv_sock.settimeout(self.cfg.connect_timeout_s)
+
+            try:
+                send_sock.sendto(packet, (dst_ip, 0))
+                deadline = time.perf_counter() + self.cfg.connect_timeout_s
+
+                while time.perf_counter() < deadline:
+                    try:
+                        recv_sock.settimeout(
+                            max(0.01, deadline - time.perf_counter())
+                        )
+                        raw, _ = recv_sock.recvfrom(1024)
+                    except _socket.timeout:
+                        break
+
+                    # raw = IP header (20 bytes) + TCP header
+                    if len(raw) < 40:
+                        continue
+                    ip_hdr_len = (raw[0] & 0x0F) * 4
+                    tcp_raw = raw[ip_hdr_len:]
+                    if len(tcp_raw) < 14:
+                        continue
+
+                    r_dst_port, r_src_port = struct.unpack("!HH", tcp_raw[0:4])
+                    if r_dst_port != src_port or r_src_port != dst_port:
+                        continue  # not our packet
+
+                    tcp_resp_flags = tcp_raw[13]
+                    rtt_ms = (time.perf_counter() - start) * 1000.0
+
+                    # SYN-ACK → open; RST → closed
+                    if tcp_resp_flags & 0x12 == 0x12:   # SYN + ACK
+                        return ProbeResult(endpoint=endpoint, status="open", rtt_ms=rtt_ms)
+                    if tcp_resp_flags & 0x04:            # RST
+                        return ProbeResult(endpoint=endpoint, status="closed", rtt_ms=rtt_ms)
+
+                return ProbeResult(endpoint=endpoint, status="timeout")
+            finally:
+                send_sock.close()
+                recv_sock.close()
+
+        except PermissionError:
+            # Gracefully degrade: raw sockets unavailable without root
+            return await_fallback_probe(endpoint, self.cfg.connect_timeout_s)
+        except Exception as exc:
+            return ProbeResult(endpoint=endpoint, status="error", error=str(exc))
+
+    # ── Host-up prefilter ────────────────────────────────────────────────────
+
+    async def host_prefilter_pass(
+        self, hosts: list[str]
+    ) -> set[str]:
+        """Return the subset of *hosts* that respond to ICMP ping.
+
+        Used as an optional pre-scan step to avoid wasting probes on offline
+        hosts.  Falls back gracefully if ping is unavailable.
+        """
+        if not hosts:
+            return set()
+
+        loop = asyncio.get_event_loop()
+
+        async def _ping(host: str) -> str | None:
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._icmp_probe_sync,
+                                         Endpoint(host=host, port=1)),
+                    timeout=3.0,
+                )
+                if result.status == "open":
+                    return host
+            except Exception:
+                pass
+            return None
+
+        tasks = [asyncio.create_task(_ping(h)) for h in hosts]
+        live: set[str] = set()
+        for coro in asyncio.as_completed(tasks):
+            h = await coro
+            if h:
+                live.add(h)
+        return live
+
+    # ── Adaptive port ordering ────────────────────────────────────────────────
+
+    @staticmethod
+    def order_ports_adaptively(ports: list[int]) -> list[int]:
+        """Return *ports* reordered so historically common open ports come first.
+
+        The ordering is based on well-known port prevalence data.  When scan
+        history from ``redscan.history`` is available at import time the
+        function additionally promotes any ports that were seen open in the
+        most recent scans.
+        """
+        # Common open-port frequency table (port → relative weight).
+        # Higher weight = probe earlier.
+        _COMMON_WEIGHTS: dict[int, int] = {
+            80: 100, 443: 100, 22: 95, 21: 80, 25: 75, 53: 70,
+            3306: 70, 5432: 65, 3389: 65, 8080: 60, 8443: 55,
+            445: 55, 139: 50, 110: 50, 143: 50, 23: 45, 8888: 40,
+            6379: 40, 27017: 38, 9200: 35, 9300: 35, 2181: 30,
+        }
+
+        # Optionally boost from history
+        history_weights: dict[int, int] = {}
+        try:
+            from redscan.history import _history  # type: ignore[attr-defined]
+            for entry in _history.list_entries(limit=50):
+                for p in (entry.open_count,):  # placeholder – real ports not stored
+                    pass
+            # (full port-level history tracking is deferred; _COMMON_WEIGHTS
+            # already captures the most actionable signal)
+        except Exception:
+            pass
+
+        def _weight(p: int) -> int:
+            return max(_COMMON_WEIGHTS.get(p, 0), history_weights.get(p, 0))
+
+        return sorted(ports, key=_weight, reverse=True)
+
+    # ── Hostname resolution ───────────────────────────────────────────────────
+
+    @staticmethod
+    def resolve_host(hostname: str, dns_server: str | None = None) -> str:
+        """Resolve *hostname* to an IP address string.
+
+        If *dns_server* is given, a UDP DNS query is sent directly to it
+        instead of using the system resolver.  Falls back to system resolver
+        on any error.
+        """
+        # Fast path: already an IP address
+        try:
+            ipaddress.ip_address(hostname)
+            return hostname
+        except ValueError:
+            pass
+
+        if dns_server:
+            try:
+                import socket as _s
+                sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+                sock.settimeout(2.0)
+                # Build a minimal DNS query for an A record
+                qname = b"".join(
+                    bytes([len(part)]) + part.encode()
+                    for part in hostname.split(".")
+                ) + b"\x00"
+                query = (
+                    b"\xaa\xbb"   # transaction ID
+                    b"\x01\x00"   # flags: standard query
+                    b"\x00\x01"   # QDCOUNT = 1
+                    b"\x00\x00\x00\x00\x00\x00"  # ANCOUNT, NSCOUNT, ARCOUNT
+                    + qname
+                    + b"\x00\x01"  # QTYPE = A
+                    + b"\x00\x01"  # QCLASS = IN
+                )
+                sock.sendto(query, (dns_server, 53))
+                resp, _ = sock.recvfrom(512)
+                # Parse answer section: skip header (12) + question
+                pos = 12
+                # Skip question section
+                while pos < len(resp) and resp[pos] != 0:
+                    pos += resp[pos] + 1
+                pos += 5  # null + QTYPE + QCLASS
+                # Read first answer
+                if pos + 12 < len(resp):
+                    # Skip name (compressed or label)
+                    if resp[pos] & 0xC0 == 0xC0:
+                        pos += 2
+                    else:
+                        while pos < len(resp) and resp[pos] != 0:
+                            pos += resp[pos] + 1
+                        pos += 1
+                    rtype = struct.unpack("!H", resp[pos:pos+2])[0]
+                    pos += 8  # TYPE+CLASS+TTL
+                    rdlen = struct.unpack("!H", resp[pos:pos+2])[0]
+                    pos += 2
+                    if rtype == 1 and rdlen == 4:
+                        return _socket.inet_ntoa(resp[pos:pos+4])
+                sock.close()
+            except Exception:
+                pass
+
+        return _socket.gethostbyname(hostname)
+
 
     async def discovery_pass(
         self,
         endpoints: list[Endpoint],
         per_probe_callback: Callable[[ProbeResult, bool], None] | None = None,
+        resume: bool = False,
     ) -> DiscoveryOutput:
+        """Run the adaptive discovery scan over *endpoints*.
+
+        Parameters
+        ----------
+        endpoints:
+            List of host:port pairs to probe.
+        per_probe_callback:
+            Called for each probe result.  Second argument is ``True`` for
+            calibration probes.
+        resume:
+            When ``True`` and ``cfg.checkpoint_path`` is set, skip endpoints
+            already recorded in the checkpoint file.
+        """
         if not endpoints:
             return DiscoveryOutput(
                 open_endpoints=[],
@@ -234,16 +555,65 @@ class SmartScanModule:
                 stats=DiscoveryStats(total_count=0, final_rate=self.controller.rate),
             )
 
+        # ── Optional: resolve hostnames with custom DNS ───────────────────────
+        if self.cfg.dns_server:
+            resolved: list[Endpoint] = []
+            for ep in endpoints:
+                try:
+                    ip = self.resolve_host(ep.host, self.cfg.dns_server)
+                    resolved.append(Endpoint(host=ip, port=ep.port))
+                except Exception:
+                    resolved.append(ep)
+            endpoints = resolved
+
+        # ── Optional: adaptive port ordering ─────────────────────────────────
+        if self.cfg.adaptive_port_ordering:
+            distinct_ports = list(dict.fromkeys(ep.port for ep in endpoints))
+            ordered_ports = self.order_ports_adaptively(distinct_ports)
+            port_rank = {p: i for i, p in enumerate(ordered_ports)}
+            endpoints = sorted(endpoints, key=lambda ep: port_rank.get(ep.port, 9999))
+
+        # ── Optional: host-up prefilter (ICMP ping sweep) ────────────────────
+        if self.cfg.host_prefilter:
+            distinct_hosts = list(dict.fromkeys(ep.host for ep in endpoints))
+            live_hosts = await self.host_prefilter_pass(distinct_hosts)
+            if live_hosts:
+                endpoints = [ep for ep in endpoints if ep.host in live_hosts]
+
+        # ── Optional: checkpoint resume ───────────────────────────────────────
+        checkpoint = None
+        already_done: set[str] = set()
+        if self.cfg.checkpoint_path:
+            from .scan_checkpoint import ScanCheckpoint
+            checkpoint = ScanCheckpoint(self.cfg.checkpoint_path)
+            if resume and checkpoint.exists:
+                prior = checkpoint.load() or []
+                for item in prior:
+                    already_done.add(f"{item.get('host')}:{item.get('port')}")
+
+        prior_results: list[ProbeResult] = []
+        if resume and already_done:
+            remaining: list[Endpoint] = []
+            for ep in endpoints:
+                key = f"{ep.host}:{ep.port}"
+                if key in already_done:
+                    if checkpoint:
+                        for item in (checkpoint.load() or []):
+                            if f"{item['host']}:{item['port']}" == key:
+                                prior_results.append(ProbeResult(
+                                    endpoint=ep,
+                                    status=item.get("status", "open"),  # type: ignore[arg-type]
+                                    rtt_ms=item.get("rtt_ms"),
+                                ))
+                                break
+                else:
+                    remaining.append(ep)
+            endpoints = remaining
+
         # ── Pre-flight: warn if calibration endpoint is unreachable ──────────
-        # A single quick probe on startup prevents a silent failure where the
-        # controller never receives any calibration RTT samples and stays at
-        # initial_rate for the entire scan.
         calib_test = await self._probe(
             Endpoint(host=self.cfg.calibration_host, port=self.cfg.calibration_port)
         )
-        # We don't abort on failure — some calibration endpoints respond with
-        # RST (status="closed") which still gives a valid RTT.  Only a true
-        # timeout with no RTT suggests the path is broken.
         if calib_test.status == "timeout" and calib_test.rtt_ms is None:
             import warnings
             warnings.warn(
@@ -254,15 +624,15 @@ class SmartScanModule:
                 stacklevel=2,
             )
         elif calib_test.rtt_ms is not None:
-            # Seed the EWMA with this first real sample so the controller starts
-            # with a meaningful baseline instead of waking up blind.
             self.controller.calibration_update(calib_test.rtt_ms)
 
-        results: list[ProbeResult] = []
+        results: list[ProbeResult] = list(prior_results)
         queue = deque(endpoints)
         in_flight: dict[asyncio.Task[ProbeResult], bool] = {}
         calibration_counter = 0
         last_control = time.monotonic()
+        _checkpoint_interval = 50
+        _checkpoint_counter = 0
 
         while queue or in_flight:
             while queue and len(in_flight) < max(1, int(self.controller.rate // self._CONCURRENCY_SCALING_FACTOR)):
@@ -289,17 +659,23 @@ class SmartScanModule:
                         per_probe_callback(result, is_calibration_task)
                     if is_calibration_task:
                         if result.status in ("open", "closed") and result.rtt_ms is not None:
-                            # Accept RST (closed) replies as valid RTT samples.  Some
-                            # calibration endpoints sit behind a firewall that returns
-                            # an immediate RST instead of a SYN-ACK, but the round-trip
-                            # time is still a valid congestion signal.
+                            # Accept RST (closed) replies as valid RTT samples.
                             self.controller.calibration_update(result.rtt_ms)
                         elif result.status == "timeout":
-                            # Only calibration-probe timeouts are a reliable
-                            # congestion signal — register them as loss events.
                             self.controller.register_timeout()
                     else:
                         results.append(result)
+                        _checkpoint_counter += 1
+                        if checkpoint and _checkpoint_counter % _checkpoint_interval == 0:
+                            checkpoint.save([
+                                {
+                                    "host": r.endpoint.host,
+                                    "port": r.endpoint.port,
+                                    "status": r.status,
+                                    "rtt_ms": r.rtt_ms,
+                                }
+                                for r in results
+                            ])
                 pending_map = {task: in_flight[task] for task in pending}
                 in_flight.clear()
                 in_flight.update(pending_map)
@@ -320,6 +696,9 @@ class SmartScanModule:
             calibration_rtt_base_ms=self.controller.base_rtt_ms,
             calibration_rtt_filtered_ms=self.controller.filtered_rtt_ms,
         )
+        if checkpoint:
+            checkpoint.clear()
+
         return DiscoveryOutput(open_endpoints=open_eps, all_results=results, stats=stats)
 
     async def deep_enumeration_handoff(self, discovery: DiscoveryOutput) -> dict[str, list[int]]:

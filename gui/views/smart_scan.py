@@ -188,9 +188,9 @@ class SmartScanView(ctk.CTkFrame):
         self._calib_host_var = tk.StringVar(value="8.8.8.8")
         self._calib_port_var = tk.IntVar(value=53)
 
-        self._add_field(cfg_frame, "Target(s) (CIDR or comma-separated IPs):", self._target_var,
-            "e.g. 192.168.1.0/24 or 10.0.0.1,10.0.0.2.  The scanner probes every "
-            "target IP × port combination.")
+        self._add_field(cfg_frame, "Target(s) (CIDR / IPv6 prefix / comma-separated IPs):", self._target_var,
+            "e.g. 192.168.1.0/24, 10.0.0.1,10.0.0.2, or 2001:db8::/64.  "
+            "The scanner probes every target IP × port combination.")
         self._add_field(cfg_frame, "Ports to probe (comma-separated):", self._port_range_var,
             "TCP/UDP ports checked on every host.  Examples: 22,80,443 for quick recon; "
             "1-1024 for thorough coverage.")
@@ -289,6 +289,72 @@ class SmartScanView(ctk.CTkFrame):
             text=(
                 "Splits probe packets into small IP fragments to evade some firewalls "
                 "and IDS rules.  Requires root; not applicable to tcp_connect / icmp types."
+            ),
+            font=("Segoe UI", 9), text_color=TEXT_MUTED,
+            justify="left", anchor="w", wraplength=310,
+        ).pack(fill="x", padx=PAD_S, pady=(0, PAD))
+
+        # ── Host-up prefilter & adaptive port ordering ────────────────────────
+        ctk.CTkFrame(self._adv_frame, height=1, fg_color="#2a4a6a").pack(
+            fill="x", pady=PAD, padx=PAD_S)
+        ctk.CTkLabel(self._adv_frame, text="Discovery Optimisations", font=FONT_H2, anchor="w").pack(
+            fill="x", padx=PAD_S)
+
+        self._host_prefilter_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self._adv_frame, text="Host-up prefilter (ICMP ping sweep)",
+            variable=self._host_prefilter_var, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+        ).pack(padx=PAD_S, pady=(PAD_S, 0), anchor="w")
+        ctk.CTkLabel(
+            self._adv_frame,
+            text=(
+                "Before port scanning, pings every host in the target list to confirm it is "
+                "up.  Eliminates wasted probes against offline hosts but adds an extra sweep "
+                "round.  Requires ICMP to be unblocked on the network."
+            ),
+            font=("Segoe UI", 9), text_color=TEXT_MUTED,
+            justify="left", anchor="w", wraplength=310,
+        ).pack(fill="x", padx=PAD_S, pady=(0, PAD_S))
+
+        self._adaptive_ports_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            self._adv_frame, text="Adaptive port ordering",
+            variable=self._adaptive_ports_var, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+        ).pack(padx=PAD_S, pady=(0, 0), anchor="w")
+        ctk.CTkLabel(
+            self._adv_frame,
+            text=(
+                "Reorders the port list so the most commonly open ports (e.g. 80, 443, 22) "
+                "are probed first.  Helps surface interesting findings early in long scans."
+            ),
+            font=("Segoe UI", 9), text_color=TEXT_MUTED,
+            justify="left", anchor="w", wraplength=310,
+        ).pack(fill="x", padx=PAD_S, pady=(0, PAD))
+
+        # ── Custom DNS ────────────────────────────────────────────────────────
+        ctk.CTkFrame(self._adv_frame, height=1, fg_color="#2a4a6a").pack(
+            fill="x", pady=PAD, padx=PAD_S)
+        ctk.CTkLabel(self._adv_frame, text="Network Options", font=FONT_H2, anchor="w").pack(
+            fill="x", padx=PAD_S)
+
+        self._dns_server_var = tk.StringVar(value="")
+        self._add_field(self._adv_frame, "Custom DNS Server (optional):", self._dns_server_var,
+            "IP address of a DNS server to use when resolving hostnames.  Leave blank to "
+            "use the system resolver.  Useful in isolated networks or for testing "
+            "split-horizon DNS setups.  e.g. 1.1.1.1 or 192.168.1.1")
+
+        # ── Checkpoint ───────────────────────────────────────────────────────
+        self._checkpoint_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self._adv_frame, text="Enable scan progress checkpoint",
+            variable=self._checkpoint_var, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+        ).pack(padx=PAD_S, pady=(PAD_S, 0), anchor="w")
+        ctk.CTkLabel(
+            self._adv_frame,
+            text=(
+                "Periodically saves discovered endpoints to ~/.redscan_scan.ckpt so the "
+                "scan can be resumed after a crash or manual abort.  The file is deleted "
+                "on clean completion."
             ),
             font=("Segoe UI", 9), text_color=TEXT_MUTED,
             justify="left", anchor="w", wraplength=310,
@@ -401,6 +467,11 @@ class SmartScanView(ctk.CTkFrame):
     # ── Config builder ────────────────────────────────────────────────────────
 
     def _build_config(self) -> DiscoveryConfig:
+        import os as _os
+        checkpoint_path: str | None = None
+        if self._checkpoint_var.get():
+            checkpoint_path = str(_os.path.expanduser("~/.redscan_scan.ckpt"))
+        dns = self._dns_server_var.get().strip() or None
         return DiscoveryConfig(
             calibration_host=self._calib_host_var.get().strip(),
             calibration_port=self._calib_port_var.get(),
@@ -419,6 +490,10 @@ class SmartScanView(ctk.CTkFrame):
             aimd_beta=self._s_beta.value,
             probe_type=self._probe_type_var.get(),          # type: ignore[arg-type]
             fragmented=self._fragmented_var.get(),
+            host_prefilter=self._host_prefilter_var.get(),
+            adaptive_port_ordering=self._adaptive_ports_var.get(),
+            checkpoint_path=checkpoint_path,
+            dns_server=dns,
         )
 
     def _parse_targets(self) -> list[Endpoint]:
@@ -437,6 +512,7 @@ class SmartScanView(ctk.CTkFrame):
             if "/" in token:
                 import ipaddress
                 try:
+                    # Handles both IPv4 and IPv6 CIDR notation
                     net = ipaddress.ip_network(token, strict=False)
                     host_list = list(net.hosts())
                     if len(host_list) > _MAX_HOSTS:
@@ -458,6 +534,24 @@ class SmartScanView(ctk.CTkFrame):
     def _start_scan(self) -> None:
         if self._running:
             return
+        # ── Checkpoint resume prompt ──────────────────────────────────────────
+        _resume = False
+        if self._checkpoint_var.get():
+            import os as _os
+            ckpt_path = _os.path.expanduser("~/.redscan_scan.ckpt")
+            if _os.path.exists(ckpt_path):
+                import tkinter.messagebox as _mb
+                _resume = _mb.askyesno(
+                    "Resume Scan",
+                    "A previous scan checkpoint was found.\n\n"
+                    "Would you like to resume from where it left off?\n\n"
+                    "Click 'Yes' to resume, 'No' to start fresh.",
+                )
+                if not _resume:
+                    try:
+                        _os.unlink(ckpt_path)
+                    except OSError:
+                        pass
         self._running = True
         self._run_btn.configure(state="disabled")
         self._rate_history.clear()
@@ -468,13 +562,14 @@ class SmartScanView(ctk.CTkFrame):
         cfg = self._build_config()
         endpoints = self._parse_targets()
         self._log_msg(
-            f"[*] Probing {len(endpoints)} endpoint(s) via {cfg.probe_type}\n"
+            f"[*] Probing {len(endpoints)} endpoint(s) via {cfg.probe_type}"
+            f"{' (resume)' if _resume else ''}\n"
         )
         threading.Thread(
-            target=self._scan_thread, args=(cfg, endpoints), daemon=True
+            target=self._scan_thread, args=(cfg, endpoints, _resume), daemon=True
         ).start()
 
-    def _scan_thread(self, cfg: DiscoveryConfig, endpoints: list[Endpoint]) -> None:
+    def _scan_thread(self, cfg: DiscoveryConfig, endpoints: list[Endpoint], resume: bool = False) -> None:
         module = SmartScanModule(cfg)
         loop = asyncio.new_event_loop()
 
@@ -494,7 +589,8 @@ class SmartScanView(ctk.CTkFrame):
                 if not self._running:
                     break
                 batch = endpoints[i : i + batch_size]
-                output = await module.discovery_pass(batch, per_probe_callback=_on_probe)
+                output = await module.discovery_pass(batch, per_probe_callback=_on_probe,
+                                                     resume=(resume and i == 0))
                 total += output.stats.total_count
                 total_dropped += output.stats.timeout_count
                 for ep in output.open_endpoints:
@@ -754,6 +850,69 @@ class SmartScanView(ctk.CTkFrame):
             fg_color="#1a2a2a", hover_color="#2a4a3a",
             corner_radius=BTN_CORNER, command=_copy_cmd,
         ).pack(fill="x", pady=(0, PAD_S))
+
+        # Export buttons ──────────────────────────────────────────────────────
+        export_row = ctk.CTkFrame(btn_row, fg_color="transparent")
+        export_row.pack(fill="x", pady=(0, PAD_S))
+
+        def _export_json() -> None:
+            import json as _json
+            import tkinter.filedialog as _fd
+            path = _fd.asksaveasfilename(
+                title="Export results as JSON",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            data = {
+                "target": self._target_var.get().strip(),
+                "timing_recommendation": t_level,
+                "open_endpoints": all_open,
+                "stats": {
+                    "open": len(all_open),
+                    "unique_hosts": len(unique_hosts),
+                    "final_rate_pps": round(final_rate, 2),
+                    "rtt_ms": round(rtt, 2) if rtt else None,
+                },
+            }
+            try:
+                with open(path, "w") as f:
+                    _json.dump(data, f, indent=2)
+            except OSError as exc:
+                import tkinter.messagebox as _mb
+                _mb.showerror("Export Failed", str(exc))
+
+        def _export_csv() -> None:
+            import csv
+            import tkinter.filedialog as _fd
+            path = _fd.asksaveasfilename(
+                title="Export results as CSV",
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            try:
+                with open(path, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=["host", "port"])
+                    writer.writeheader()
+                    writer.writerows(all_open)
+            except OSError as exc:
+                import tkinter.messagebox as _mb
+                _mb.showerror("Export Failed", str(exc))
+
+        ctk.CTkButton(
+            export_row, text="💾  Export JSON",
+            fg_color="#1a3a2a", hover_color="#2a5a3a",
+            corner_radius=BTN_CORNER, command=_export_json,
+        ).pack(side="left", fill="x", expand=True, padx=(0, PAD_S))
+        ctk.CTkButton(
+            export_row, text="📄  Export CSV",
+            fg_color="#1a3a2a", hover_color="#2a5a3a",
+            corner_radius=BTN_CORNER, command=_export_csv,
+        ).pack(side="left", fill="x", expand=True)
+
         ctk.CTkButton(
             btn_row, text="Close",
             fg_color="transparent", hover_color="#2a2a3a",
