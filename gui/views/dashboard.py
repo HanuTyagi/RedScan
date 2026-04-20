@@ -37,10 +37,14 @@ from gui.styles import (
     TEXT_DANGER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SUCCESS,
 )
 from redscan.preset_library import PRESET_CATALOGUE, get_by_key
+from redscan.conflict_manager import ConflictManager
 
 _OPEN_PORT_RE = re.compile(r"(?P<port>\d+)/(?P<proto>tcp|udp)\s+open\s+(?P<service>\S+)(?:\s+(?P<version>.*))?")
 _HOST_RE = re.compile(r"Nmap scan report for (.+)")
 _OS_RE = re.compile(r"OS details?: (.+)")
+
+# Shared conflict manager instance (stateless, safe to share)
+_conflict_manager = ConflictManager()
 
 # Path to user-saved Command-Factory presets.
 _USER_PRESETS_PATH = Path.home() / ".redscan_presets.json"
@@ -385,58 +389,27 @@ class DashboardView(ctk.CTkFrame):
         except OSError:
             return None
 
-    def _log_preflight_warnings(self, cmd: list[str]) -> None:
-        """Detect known Nmap flag conflicts and log advisory messages before the scan starts.
+    def _log_preflight_warnings(self, cmd: list[str]) -> list[str]:
+        """Run the dynamic conflict manager against *cmd*.
 
-        Rules applied (in priority order):
-        1. -sn + non-empty ports field → ports silently dropped (auto-resolved).
-        2. dns-brute script against an IP address → warning (user should use a domain).
-        3. -f / --mtu + -sT → fragmentation incompatible with connect scan.
-        4. Raw-socket flags without root/admin privileges → privilege warning.
+        Auto-fix rules mutate the command (e.g. remove -sV when -sn is set);
+        warn-only rules emit advisory messages to the log.
+
+        Returns the (possibly modified) command list.
         """
-        preset_key = self._preset_var.get()
-        ports_str = self._ports_var.get().strip()
         target = self._target_var.get().strip()
-        preset = get_by_key(preset_key) if preset_key != "(none)" else None
+        ports_str = self._ports_var.get().strip()
 
-        # Rule 1: host-discovery preset with a non-empty ports field.
-        if "-sn" in cmd and ports_str:
-            self._log(
-                "[!] CONFLICT (auto-resolved): '-sn' performs host discovery only — "
-                "port specification ignored.\n"
-            )
-
-        # Rule 2: dns-brute script against an IP address or localhost.
-        if preset and "dns-brute" in preset.scripts:
-            if (
-                re.match(r"^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$", target)
-                or target.lower() == "localhost"
-            ):
-                self._log(
-                    f"[!] SCRIPT WARNING: 'dns-brute' requires a domain name, not an IP/localhost "
-                    f"('{target}'). The script will likely fail.\n"
-                )
-
-        # Rule 3: packet fragmentation is incompatible with TCP Connect scan.
-        if ("-f" in cmd or "--mtu" in cmd) and "-sT" in cmd:
-            self._log(
-                "[!] FLAG CONFLICT: '-f'/'--mtu' (packet fragmentation) cannot be combined with "
-                "'-sT' (TCP Connect). Connect scans use OS sockets, not raw packets — "
-                "the fragmentation flag will be ignored by nmap.\n"
-            )
-
-        # Rule 4: raw-socket flags require root / Administrator.
         try:
             is_root = os.geteuid() == 0
         except AttributeError:
-            is_root = True  # Windows — skip this check
-        raw_flags = {"-sS", "-sU", "-O", "-f", "-sX", "-sF", "-sN"}
-        missing_root = [f for f in raw_flags if f in cmd]
-        if missing_root and not is_root:
-            self._log(
-                f"[!] PRIVILEGE WARNING: {' '.join(missing_root)} require root/admin. "
-                "Nmap may downgrade to a TCP Connect scan or fail outright.\n"
-            )
+            is_root = True  # Windows
+
+        clean_cmd, messages = _conflict_manager.apply(cmd, target, ports_str, is_root)
+        for severity, text in messages:
+            self._log(text + "\n")
+
+        return clean_cmd
 
     def _start_scan(self) -> None:
         if self._running:
@@ -449,8 +422,9 @@ class DashboardView(ctk.CTkFrame):
         self._run_btn.configure(state="disabled")
 
         cmd = self._build_command()
+        # Run the conflict manager: auto-fix rules may return a cleaned cmd.
+        cmd = self._log_preflight_warnings(cmd)
         self._command_used = " ".join(cmd)
-        self._log_preflight_warnings(cmd)
         self._log(f"[*] Starting scan: {self._command_used}\n")
         self._status_var.set("Scanning…")
 

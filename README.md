@@ -8,16 +8,100 @@ Conference-demo-ready RedScan with a **unified GUI** and a full backend engine.
 
 | Layer | Description |
 |---|---|
-| 🎯 **Preset Library** | 29 expert scanning profiles across 6 categories with aggressiveness ratings |
+| 🎯 **Preset Library** | 80+ expert scanning profiles across 9 categories; presets can belong to multiple categories simultaneously |
 | 🔧 **Command Factory** | Visual flag canvas builder with real-time conflict resolution and "Save as Preset" |
 | 📊 **Scan Dashboard** | Real-time host/port table, XML enrichment for richer version data, session save/load, live log |
 | ⚡ **Smart Scan** | Adaptive PID+AIMD rate controller; calibration accepts RST replies as valid RTT samples |
 | 🤖 **AI Insights** | Pluggable LLM analysis (OpenAI, Gemini, or built-in Mock); provider config persists across restarts |
 | 🌐 **FastAPI service** | REST + NDJSON streaming API with optional X-API-Key auth and per-IP rate limiting |
+| 🧠 **Conflict Manager** | Rule-based engine that auto-fixes silent incompatibilities and warns about advisory conflicts before every scan |
 
 ---
 
-## Bug Fixes (this release)
+## Preset Library
+
+### Categories (9)
+
+| Icon | Category | Preset Count |
+|---|---|---|
+| 🔍 | Host Discovery | 8 |
+| 🚪 | Port Scanning | 10 |
+| 📋 | Service Enumeration | 8 |
+| 🛡 | Vulnerability Scanning | 12 |
+| 🌐 | Web Application | 9 |
+| 🥷 | Stealth & Evasion | 8 |
+| ⚙️ | Service-Specific | 14 |
+| 🖧 | Network Infrastructure | 5 |
+| 🔑 | Authentication & Credentials | 8 |
+
+Cross-category presets (e.g. `snmp_sweep`, `smb_vuln`) appear in *all* their listed
+categories — the browser shows the same preset card under each relevant heading without
+duplicating the underlying object.
+
+### Navigation (Lazy Loading)
+
+The Preset Library now uses a two-stage navigation model:
+
+1. **Landing page** — 3-column grid of category tiles, each showing the icon, name, and
+   preset count.  No preset data is loaded until a tile is clicked.
+2. **Category page** — 2-column card grid for the selected category, with a ← Back button.
+3. **Search mode** — typing in the search bar from any page performs a cross-category
+   full-text search (name, description, flags, script names).
+
+---
+
+## Dynamic Conflict Manager
+
+`redscan/conflict_manager.py` provides a **rule-based** conflict engine that is
+evaluated before every scan.  Rules are data objects — adding a new rule requires
+no changes to the dashboard or any other caller.
+
+### Rule types
+
+| Type | Behaviour |
+|---|---|
+| `auto_fix` | Mutates the command list silently and logs an advisory |
+| `warning` | Logs a warning but does not mutate the command |
+| `info` | Logs a neutral informational note |
+
+### Built-in rules (12)
+
+| Rule name | Trigger | Action |
+|---|---|---|
+| `host_discovery_drops_ports` | `-sn` with a non-empty ports field | auto_fix |
+| `sn_plus_sv_incompatible` | `-sn` + `-sV` | auto_fix – removes `-sV` |
+| `sn_plus_sc_incompatible` | `-sn` + `-sC` | auto_fix – removes `-sC` |
+| `frag_with_connect_scan` | `-f`/`--mtu` + `-sT` | auto_fix – removes frag flags |
+| `conflicting_scan_types` | `-sS` + `-sT` | auto_fix – removes `-sT` |
+| `dns_brute_needs_domain` | `dns-brute` script + IP/localhost target | warning |
+| `raw_socket_without_root` | Raw-socket flag without root privileges | warning |
+| `udp_allports_very_slow` | `-sU -p-` | warning |
+| `stealth_defeated_by_aggressive_timing` | Stealth scan type + `-T5` | warning |
+| `os_detect_without_root` | `-O` without root | warning |
+| `script_with_host_discovery_only` | `--script` + `-sn` | warning |
+| `decoy_with_connect_scan` | `-D` + `-sT` | warning |
+| `localhost_vuln_scan` | `vuln` script against localhost | info |
+| `aggressive_timing_with_brute` | `-T5` + brute-force script | warning |
+
+### Extending the rule set
+
+```python
+from redscan.conflict_manager import ConflictRule, ConflictManager
+
+my_rule = ConflictRule(
+    name="no_syn_on_port_443",
+    check=lambda cmd, target, ports, root: "-sS" in cmd and "443" in ports,
+    severity="warning",
+    message=lambda cmd, target, ports, root: "[!] Port 443 SYN scans are often rate-limited.",
+)
+
+manager = ConflictManager(rules=[*DEFAULT_RULES, my_rule])
+clean_cmd, messages = manager.apply(cmd, target, ports_str)
+```
+
+---
+
+## Bug Fixes
 
 | File | Fix |
 |---|---|
@@ -119,7 +203,8 @@ guided follow-up suggestions.
 
 ```
 redscan/
-  preset_library.py   29 ScanPreset definitions with 6 categories
+  preset_library.py   80+ ScanPreset definitions across 9 categories; cross-category support
+  conflict_manager.py Rule-based nmap command conflict engine (auto-fix + warn)
   smart_scan.py       Adaptive rate controller (EWMA + PID + AIMD)
   command_factory.py  Graph-based nmap command assembler (networkx)
   runtime_parser.py   Async incremental output parser
@@ -153,7 +238,8 @@ xml_parser.py         Post-scan XML enrichment helper
 python -m pytest -q
 ```
 
-Tests cover preset library integrity, command factory conflict logic,
-LLM response parsing, host record serialization, smart scan discovery,
-runtime parser events, and API happy-path.
+Tests cover preset library integrity (unique keys, aggressiveness values, cross-category
+placement, semantic hints), conflict manager rules (auto-fix mutations, warning triggers,
+false-positive checks, command immutability), LLM response parsing, host record
+serialization, smart scan discovery, runtime parser events, and API happy-path.
 
