@@ -525,10 +525,18 @@ class ConflictManager:
     ----------
     rules:
         Rule list to use.  Defaults to ``DEFAULT_RULES``.
+    disabled_rules:
+        Optional set of rule *names* to skip during evaluation.  Useful for
+        the GUI rule editor which lets users temporarily mute specific rules.
     """
 
-    def __init__(self, rules: list[ConflictRule] | None = None) -> None:
+    def __init__(
+        self,
+        rules: list[ConflictRule] | None = None,
+        disabled_rules: set[str] | None = None,
+    ) -> None:
         self._rules = rules if rules is not None else DEFAULT_RULES
+        self._disabled: set[str] = set(disabled_rules) if disabled_rules else set()
 
     def apply(
         self,
@@ -572,6 +580,8 @@ class ConflictManager:
         messages: list[_INFO] = []
 
         for rule in self._rules:
+            if rule.name in self._disabled:
+                continue
             if rule.check(clean_cmd, target, ports_str, is_root):
                 msg = rule.message(clean_cmd, target, ports_str, is_root)
                 messages.append((rule.severity, msg))

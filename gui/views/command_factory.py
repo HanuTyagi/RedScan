@@ -20,9 +20,13 @@ saved as a named preset.
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
+import subprocess
+import threading
 import tkinter as tk
 import tkinter.filedialog as filedialog
+from pathlib import Path
 from typing import Callable
 
 import customtkinter as ctk
@@ -32,7 +36,7 @@ from gui.styles import (
     CARD_CORNER, FONT_BODY, FONT_H1, FONT_H2, FONT_MONO, FONT_SMALL, PAD,
     PAD_S, TEXT_MUTED, TEXT_PRIMARY,
 )
-from redscan.conflict_manager import ConflictManager
+from redscan.conflict_manager import ConflictManager, DEFAULT_RULES
 from redscan.preset_library import (
     CATEGORY_ICONS, CATEGORY_ORDER, ScanPreset, get_by_category,
 )
@@ -283,6 +287,22 @@ class CommandFactoryView(ctk.CTkFrame):
         # Command history — most recent runs (capped at 10)
         self._history: list[str] = []
 
+        # Conflict-rule editor: set of rule names the user has muted
+        self._disabled_rules: set[str] = set()
+
+        # Drag-to-reorder: per-gesture state
+        self._drag_data: dict = {}
+        # [(x1, y1, x2, y2, piece_idx)] — rebuilt each _redraw_canvas call
+        self._piece_hits: list[tuple[int, int, int, int, int]] = []
+
+        # Diff view: tokens added/removed by the last load_preset call
+        self._diff_added: set[str] = set()
+
+        # Macros: {name: [token1, token2, …]}, persisted to ~/.redscan_macros.json
+        self._macros: dict[str, list[str]] = {}
+        self._macros_path: Path = Path.home() / ".redscan_macros.json"
+        self._load_macros()
+
         self._target_var = tk.StringVar(value="192.168.1.1")
         self._target_var.trace_add("write", lambda *_: self._update_preview())
         self._ports_var = tk.StringVar(value="")
@@ -509,10 +529,40 @@ class CommandFactoryView(ctk.CTkFrame):
             hover_color="#4a2a5a",
             corner_radius=BTN_CORNER,
             command=self._explain_command,
+        ).pack(side="left", padx=(0, PAD_S))
+
+        ctk.CTkButton(
+            btn_row,
+            text="⚙  Rules",
+            fg_color="#1a2a1a",
+            hover_color="#2a4a2a",
+            corner_radius=BTN_CORNER,
+            command=self._show_rules_dialog,
+        ).pack(side="left", padx=(0, PAD_S))
+
+        ctk.CTkButton(
+            btn_row,
+            text="✓  Validate",
+            fg_color="#1a2a3a",
+            hover_color="#2a4a5a",
+            corner_radius=BTN_CORNER,
+            command=self._validate_command,
+        ).pack(side="left", padx=(0, PAD_S))
+
+        ctk.CTkButton(
+            btn_row,
+            text="🔗  Macros",
+            fg_color="#2a1a2a",
+            hover_color="#4a2a4a",
+            corner_radius=BTN_CORNER,
+            command=self._show_macros_dialog,
         ).pack(side="left")
 
         self._refresh_palette()
         self.after(50, self._redraw_canvas)
+        # Drag-to-reorder bindings on the canvas widget
+        self._canvas.bind("<B1-Motion>", self._on_drag_motion)
+        self._canvas.bind("<ButtonRelease-1>", self._on_drag_end)
 
     # ── Palette ──────────────────────────────────────────────────────────────
 
@@ -660,6 +710,8 @@ class CommandFactoryView(ctk.CTkFrame):
 
     def _redraw_canvas(self, new_piece: _FlagPieceData | None = None) -> None:
         self._canvas.delete("all")
+        self._piece_hits = []
+
         if not self._placed:
             self._canvas.create_text(
                 200, 80,
@@ -682,9 +734,19 @@ class CommandFactoryView(ctk.CTkFrame):
                 y += row_h + 4
 
             is_new = (fd is new_piece)
-            fill    = (_NSE_PIECE_NEW_FILL    if fd.is_nse else _PIECE_NEW_FILL)    if is_new else (_NSE_PIECE_REST_FILL    if fd.is_nse else _PIECE_REST_FILL)
-            outline = (_NSE_PIECE_NEW_OUTLINE  if fd.is_nse else _PIECE_NEW_OUTLINE) if is_new else (_NSE_PIECE_REST_OUTLINE if fd.is_nse else _PIECE_REST_OUTLINE)
-            txt_c   = "#aaffcc" if fd.is_nse else "#aaddff"
+            is_diff = fd.first_token in self._diff_added
+
+            if is_new:
+                fill    = _NSE_PIECE_NEW_FILL    if fd.is_nse else _PIECE_NEW_FILL
+                outline = _NSE_PIECE_NEW_OUTLINE  if fd.is_nse else _PIECE_NEW_OUTLINE
+            elif is_diff:
+                # Diff-highlight: green tint for pieces added by last load_preset
+                fill, outline = "#1a3a1a", "#3aaa3a"
+            else:
+                fill    = _NSE_PIECE_REST_FILL    if fd.is_nse else _PIECE_REST_FILL
+                outline = _NSE_PIECE_REST_OUTLINE  if fd.is_nse else _PIECE_REST_OUTLINE
+
+            txt_c = "#aaffcc" if fd.is_nse else ("#ccffcc" if is_diff else "#aaddff")
 
             r = self._canvas.create_rectangle(
                 x, y, x + w, y + self._PIECE_H,
@@ -703,8 +765,15 @@ class CommandFactoryView(ctk.CTkFrame):
                 close_x, close_y, text="✕", fill="#e74c3c",
                 font=("Segoe UI", 11, "bold"),
             )
+            # Close "✕" removes the piece on click (not a drag)
             self._canvas.tag_bind(c, "<Button-1>", lambda _e, f=fd: self._remove_piece(f))
-            self._canvas.tag_bind(r, "<Button-1>", lambda _e, f=fd: self._remove_piece(f))
+            # Piece body starts a drag on press
+            self._canvas.tag_bind(
+                r, "<ButtonPress-1>",
+                lambda _e, i=idx: self._on_drag_start(_e, i),
+            )
+            # Record bounding box for hit testing during drag
+            self._piece_hits.append((x, y, x + w, y + self._PIECE_H, idx))
 
             if is_new:
                 new_rect_id = r
@@ -804,7 +873,9 @@ class CommandFactoryView(ctk.CTkFrame):
         except AttributeError:
             is_root = True
 
-        _, messages = _factory_conflict_manager.apply(cmd, target, "", is_root)
+        _, messages = ConflictManager(disabled_rules=self._disabled_rules).apply(
+            cmd, target, "", is_root
+        )
         if not messages:
             self._conflict_bar.pack_forget()
             return
@@ -843,7 +914,8 @@ class CommandFactoryView(ctk.CTkFrame):
         return self._cmd_var.get()
 
     def load_preset(self, preset: ScanPreset) -> None:
-        """Load a preset's flags + scripts into the canvas."""
+        """Load a preset's flags + scripts into the canvas, highlighting new pieces."""
+        before_tokens = {fd.first_token for fd in self._placed}
         self._clear_canvas()
         preset_flags = list(preset.flags)
         preset_scripts = list(preset.scripts)
@@ -864,14 +936,20 @@ class CommandFactoryView(ctk.CTkFrame):
                 matched_script = bool(piece_scripts & set(preset_scripts))
             if matched_flag or matched_script:
                 self._placed.append(fd)
+        # Record which tokens are new (for diff highlighting)
+        after_tokens = {fd.first_token for fd in self._placed}
+        self._diff_added = after_tokens - before_tokens
         self._redraw_canvas()
         self._refresh_palette()
         self._update_preview()
+        # Clear diff highlights after 2 s so the canvas returns to normal
+        self.after(2000, self._clear_diff)
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
     def _clear_canvas(self) -> None:
         self._placed.clear()
+        self._diff_added = set()
         self._redraw_canvas()
         self._refresh_palette()
         self._update_preview()
@@ -1065,3 +1143,437 @@ class CommandFactoryView(ctk.CTkFrame):
                 wraplength=400,
             ).pack(padx=PAD, pady=PAD, expand=True)
             ctk.CTkButton(dlg, text="OK", command=dlg.destroy).pack(pady=(0, PAD))
+
+    # ── Drag-to-reorder canvas pieces ────────────────────────────────────────
+
+    _DRAG_THRESHOLD = 6  # pixels — below this a "drag" is treated as a click
+
+    def _on_drag_start(self, event: tk.Event, piece_idx: int) -> None:
+        self._drag_data = {
+            "idx": piece_idx,
+            "x0": event.x,
+            "y0": event.y,
+            "dragging": False,
+        }
+
+    def _on_drag_motion(self, event: tk.Event) -> None:
+        dd = self._drag_data
+        if not dd:
+            return
+        dx = abs(event.x - dd["x0"])
+        dy = abs(event.y - dd["y0"])
+        if not dd["dragging"] and (dx > self._DRAG_THRESHOLD or dy > self._DRAG_THRESHOLD):
+            dd["dragging"] = True
+        if dd["dragging"]:
+            # Draw a vertical insertion indicator
+            self._canvas.delete("drag_indicator")
+            ins = self._get_insert_idx(event.x, event.y)
+            x_ins = self._get_insert_x(ins)
+            if x_ins >= 0:
+                y1 = max(0, event.y - 20)
+                y2 = event.y + 20
+                self._canvas.create_line(
+                    x_ins, y1, x_ins, y2,
+                    fill="#ffdd44", width=3, tags="drag_indicator",
+                )
+
+    def _on_drag_end(self, event: tk.Event) -> None:
+        dd = self._drag_data
+        if not dd:
+            return
+        if dd.get("dragging"):
+            self._canvas.delete("drag_indicator")
+            src_idx = dd["idx"]
+            ins_idx = self._get_insert_idx(event.x, event.y)
+            # Adjust for removal of src element before insertion
+            if ins_idx > src_idx:
+                ins_idx -= 1
+            if ins_idx != src_idx and 0 <= src_idx < len(self._placed):
+                piece = self._placed.pop(src_idx)
+                self._placed.insert(ins_idx, piece)
+                self._diff_added = set()
+                self._redraw_canvas()
+                self._update_preview()
+        self._drag_data = {}
+
+    def _get_insert_idx(self, x: int, y: int) -> int:
+        """Return the insertion index (0..len) corresponding to canvas position (x, y)."""
+        if not self._piece_hits:
+            return len(self._placed)
+        best_idx = len(self._placed)
+        best_dist = float("inf")
+        for x1, y1, x2, y2, idx in self._piece_hits:
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            dist = abs(x - cx) + abs(y - cy) * 2  # weight vertical distance more
+            if dist < best_dist:
+                best_dist = dist
+                # If cursor is left of piece midpoint → insert before; else after
+                best_idx = idx if x < cx else idx + 1
+        return max(0, min(best_idx, len(self._placed)))
+
+    def _get_insert_x(self, ins_idx: int) -> int:
+        """Return the x coordinate for the insertion indicator line."""
+        if not self._piece_hits:
+            return -1
+        if ins_idx == 0:
+            return self._piece_hits[0][0] - 4
+        if ins_idx >= len(self._piece_hits):
+            return self._piece_hits[-1][2] + 4
+        return (self._piece_hits[ins_idx - 1][2] + self._piece_hits[ins_idx][0]) // 2
+
+    # ── Conflict rule editor ─────────────────────────────────────────────────
+
+    def _show_rules_dialog(self) -> None:
+        """Open a panel listing all conflict rules with per-rule on/off toggles."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Conflict Rule Editor")
+        popup.geometry("700x500")
+        popup.grab_set()
+
+        ctk.CTkLabel(
+            popup,
+            text="Toggle rules on/off — disabled rules are skipped by the conflict checker:",
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(padx=PAD, pady=(PAD, 0), anchor="w")
+
+        sev_icons = {
+            "auto_fix": "🔧",
+            "warning":  "⚠",
+            "error":    "⛔",
+            "info":     "ℹ",
+        }
+        sev_colors = {
+            "auto_fix": "#88ccff",
+            "warning":  "#ffcc88",
+            "error":    "#ffaaaa",
+            "info":     "#aaffaa",
+        }
+
+        scroll = ctk.CTkScrollableFrame(popup, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=PAD, pady=PAD_S)
+
+        # Track vars so we can read them on "Apply"
+        check_vars: dict[str, tk.BooleanVar] = {}
+
+        for rule in DEFAULT_RULES:
+            enabled = rule.name not in self._disabled_rules
+            var = tk.BooleanVar(value=enabled)
+            check_vars[rule.name] = var
+
+            row = ctk.CTkFrame(scroll, fg_color="#1a2a3a", corner_radius=6)
+            row.pack(fill="x", pady=2)
+
+            ctk.CTkCheckBox(
+                row,
+                text="",
+                variable=var,
+                width=30,
+                fg_color=ACCENT,
+                hover_color=ACCENT_HOVER,
+            ).pack(side="left", padx=(PAD_S, 0), pady=6)
+
+            icon = sev_icons.get(rule.severity, "•")
+            col = sev_colors.get(rule.severity, "#cccccc")
+            ctk.CTkLabel(
+                row,
+                text=f"{icon} {rule.severity}",
+                font=("Segoe UI", 9, "bold"),
+                text_color=col,
+                width=80,
+            ).pack(side="left", padx=(PAD_S, 0))
+
+            ctk.CTkLabel(
+                row,
+                text=rule.name.replace("_", " "),
+                font=FONT_SMALL,
+                text_color="#aaddff",
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True, padx=PAD_S)
+
+        def _apply_rules() -> None:
+            self._disabled_rules = {
+                name for name, var in check_vars.items() if not var.get()
+            }
+            self._update_preview()
+            popup.destroy()
+
+        btn_row = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_row.pack(fill="x", padx=PAD, pady=(0, PAD))
+        ctk.CTkButton(
+            btn_row, text="Apply", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=_apply_rules,
+        ).pack(side="left", padx=(0, PAD_S))
+        ctk.CTkButton(
+            btn_row, text="Enable All",
+            fg_color="#1a3a1a", hover_color="#2a5a2a",
+            command=lambda: [v.set(True) for v in check_vars.values()],
+        ).pack(side="left", padx=(0, PAD_S))
+        ctk.CTkButton(
+            btn_row, text="Cancel", fg_color="#3a1a1a", hover_color="#5a2a2a",
+            command=popup.destroy,
+        ).pack(side="left")
+
+    # ── Live nmap validation ─────────────────────────────────────────────────
+
+    def _validate_command(self) -> None:
+        """Check nmap availability and flag syntax in a background thread."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Validate Command")
+        popup.geometry("640x380")
+        popup.grab_set()
+
+        status_var = tk.StringVar(value="⏳  Running validation…")
+        ctk.CTkLabel(
+            popup, textvariable=status_var, font=FONT_SMALL,
+        ).pack(padx=PAD, pady=(PAD, 0), anchor="w")
+
+        result_box = ctk.CTkTextbox(popup, font=FONT_MONO, fg_color="#0d1b2a",
+                                    text_color="#7feeaa", state="disabled")
+        result_box.pack(fill="both", expand=True, padx=PAD, pady=PAD_S)
+        ctk.CTkButton(popup, text="Close", command=popup.destroy).pack(pady=(0, PAD))
+
+        cmd = self.get_command().split()
+
+        def _run() -> None:
+            lines: list[str] = []
+            # --- nmap version ---
+            try:
+                ver_res = subprocess.run(
+                    ["nmap", "--version"],
+                    capture_output=True, text=True, timeout=8,
+                )
+                if ver_res.returncode == 0:
+                    first_line = ver_res.stdout.splitlines()[0] if ver_res.stdout else ""
+                    lines.append(f"✅  nmap found: {first_line}")
+                else:
+                    lines.append("❌  nmap --version returned non-zero exit code.")
+                    lines.append(ver_res.stderr.strip())
+            except FileNotFoundError:
+                lines.append("❌  nmap is NOT on PATH.  Install nmap to use this feature.")
+                _post(lines, ok=False)
+                return
+            except Exception as exc:
+                lines.append(f"❌  Error running nmap: {exc}")
+                _post(lines, ok=False)
+                return
+
+            # --- ConflictManager check ---
+            target = self._target_var.get().strip() or "127.0.0.1"
+            ports_str = self._ports_var.get().strip()
+            try:
+                is_root = os.geteuid() == 0
+            except AttributeError:
+                is_root = True
+            _, messages = ConflictManager(
+                disabled_rules=self._disabled_rules,
+            ).apply(cmd, target, ports_str, is_root)
+            if not messages:
+                lines.append("✅  No conflict-manager warnings.")
+            for sev, txt in messages:
+                icon = "⛔" if sev == "error" else ("⚠" if sev == "warning" else "🔧")
+                lines.append(f"{icon}  [{sev}] {txt}")
+
+            # --- list-targets dry-run ---
+            try:
+                user_flags = [t for t in cmd if t.startswith("-")]
+                dry_cmd = ["nmap", "-sL", "-n"] + user_flags + ["192.0.2.0/30"]
+                dry_res = subprocess.run(
+                    dry_cmd, capture_output=True, text=True, timeout=12,
+                )
+                if dry_res.returncode == 0:
+                    lines.append("✅  nmap accepted the flags (list-targets dry-run passed).")
+                else:
+                    err = (dry_res.stderr or dry_res.stdout).strip()
+                    lines.append(f"⚠   nmap flag syntax issue:\n    {err}")
+            except Exception as exc:
+                lines.append(f"ℹ   Could not run dry-run check: {exc}")
+
+            _post(lines, ok=True)
+
+        def _post(lines: list[str], ok: bool) -> None:
+            def _update() -> None:
+                if not popup.winfo_exists():
+                    return
+                status_var.set("✅  Validation complete." if ok else "❌  Validation failed.")
+                result_box.configure(state="normal")
+                result_box.delete("0.0", "end")
+                result_box.insert("end", "\n\n".join(lines))
+                result_box.configure(state="disabled")
+            popup.after(0, _update)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ── Command diff helper ───────────────────────────────────────────────────
+
+    def _clear_diff(self) -> None:
+        """Remove diff highlighting and redraw the canvas normally."""
+        if self._diff_added:
+            self._diff_added = set()
+            self._redraw_canvas()
+
+    # ── Macros ───────────────────────────────────────────────────────────────
+
+    def _load_macros(self) -> None:
+        try:
+            if self._macros_path.exists():
+                data = json.loads(self._macros_path.read_text())
+                if isinstance(data, dict):
+                    self._macros = data
+        except Exception:
+            self._macros = {}
+
+    def _save_macros(self) -> None:
+        try:
+            self._macros_path.write_text(json.dumps(self._macros, indent=2))
+        except OSError:
+            pass
+
+    def _show_macros_dialog(self) -> None:
+        """Manage piece groups / macros: save the current canvas as a macro,
+        or merge-load a saved macro onto the canvas."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Piece Macros")
+        popup.geometry("600x460")
+        popup.grab_set()
+
+        # ── Save current canvas as macro ──────────────────────────────────────
+        save_frame = ctk.CTkFrame(popup, fg_color="#1a2a3a", corner_radius=8)
+        save_frame.pack(fill="x", padx=PAD, pady=(PAD, PAD_S))
+
+        ctk.CTkLabel(
+            save_frame,
+            text="💾  Save current canvas as a macro:",
+            font=("Segoe UI", 11, "bold"),
+            text_color="#aaddff",
+            anchor="w",
+        ).pack(padx=PAD_S, pady=(PAD_S, 0), anchor="w")
+
+        name_row = ctk.CTkFrame(save_frame, fg_color="transparent")
+        name_row.pack(fill="x", padx=PAD_S, pady=PAD_S)
+        name_entry = ctk.CTkEntry(
+            name_row,
+            font=FONT_SMALL,
+            placeholder_text="Macro name, e.g. Web Recon",
+            width=300,
+        )
+        name_entry.pack(side="left", padx=(0, PAD_S))
+
+        def _save_macro() -> None:
+            name = name_entry.get().strip()
+            if not name:
+                return
+            tokens = [fd.first_token for fd in self._placed]
+            if not tokens:
+                return
+            self._macros[name] = tokens
+            self._save_macros()
+            name_entry.delete(0, "end")
+            _refresh_list()
+
+        ctk.CTkButton(
+            name_row,
+            text="Save Macro",
+            width=110,
+            fg_color="#1e4a6e",
+            hover_color="#2a6a9e",
+            corner_radius=6,
+            font=FONT_SMALL,
+            command=_save_macro,
+        ).pack(side="left")
+
+        # ── Saved macros list ─────────────────────────────────────────────────
+        ctk.CTkLabel(
+            popup,
+            text="Saved macros — click ▶ Load to merge-place onto canvas, 🗑 to delete:",
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(padx=PAD, pady=(0, 0), anchor="w")
+
+        list_frame = ctk.CTkScrollableFrame(popup, fg_color="transparent")
+        list_frame.pack(fill="both", expand=True, padx=PAD, pady=PAD_S)
+
+        def _refresh_list() -> None:
+            for w in list_frame.winfo_children():
+                w.destroy()
+            if not self._macros:
+                ctk.CTkLabel(
+                    list_frame,
+                    text="No macros saved yet.",
+                    font=FONT_SMALL,
+                    text_color=TEXT_MUTED,
+                ).pack(pady=PAD)
+                return
+            for macro_name, tokens in list(self._macros.items()):
+                row = ctk.CTkFrame(list_frame, fg_color="#1a2a3a", corner_radius=6)
+                row.pack(fill="x", pady=2)
+
+                info = ctk.CTkFrame(row, fg_color="transparent")
+                info.pack(side="left", fill="x", expand=True, padx=PAD_S, pady=4)
+                ctk.CTkLabel(
+                    info,
+                    text=macro_name,
+                    font=("Segoe UI", 11, "bold"),
+                    text_color="#aaddff",
+                    anchor="w",
+                ).pack(anchor="w")
+                ctk.CTkLabel(
+                    info,
+                    text="  ".join(tokens[:8]) + ("  …" if len(tokens) > 8 else ""),
+                    font=("Courier New", 9),
+                    text_color="#5588aa",
+                    anchor="w",
+                ).pack(anchor="w")
+
+                ctk.CTkButton(
+                    row,
+                    text="▶ Load",
+                    width=72,
+                    height=28,
+                    font=FONT_SMALL,
+                    fg_color=ACCENT,
+                    hover_color=ACCENT_HOVER,
+                    corner_radius=6,
+                    command=lambda t=tokens: self._merge_macro(t),
+                ).pack(side="right", padx=(0, PAD_S), pady=4)
+
+                def _delete(n: str = macro_name) -> None:
+                    self._macros.pop(n, None)
+                    self._save_macros()
+                    _refresh_list()
+
+                ctk.CTkButton(
+                    row,
+                    text="🗑",
+                    width=36,
+                    height=28,
+                    font=("Segoe UI", 13),
+                    fg_color="#3a1a1a",
+                    hover_color="#5a2a2a",
+                    corner_radius=6,
+                    command=_delete,
+                ).pack(side="right", pady=4)
+
+        _refresh_list()
+        ctk.CTkButton(popup, text="Close", command=popup.destroy).pack(pady=(0, PAD))
+
+    def _merge_macro(self, tokens: list[str]) -> None:
+        """Merge-load a macro by placing any of its pieces that aren't already
+        on the canvas and that aren't blocked by conflict rules."""
+        placed_tokens = {fd.first_token for fd in self._placed}
+        before_tokens = set(placed_tokens)
+        added = False
+        for fd in self._flags_data:
+            if fd.first_token in tokens and fd.first_token not in placed_tokens:
+                self._placed.append(fd)
+                placed_tokens.add(fd.first_token)
+                added = True
+        if added:
+            after_tokens = {fd.first_token for fd in self._placed}
+            self._diff_added = after_tokens - before_tokens
+            self._redraw_canvas()
+            self._refresh_palette()
+            self._update_preview()
+            self.after(2000, self._clear_diff)
+
