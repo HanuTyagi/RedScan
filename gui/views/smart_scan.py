@@ -30,6 +30,7 @@ from gui.styles import (
     TEXT_MUTED, TEXT_SUCCESS,
 )
 from redscan.models import DiscoveryConfig, DiscoveryStats, Endpoint, ProbeResult
+from redscan.preset_library import PRESET_CATALOGUE
 from redscan.smart_scan import SmartScanModule
 
 # ── Timing recommendation ────────────────────────────────────────────────────
@@ -51,6 +52,39 @@ def _recommend_timing(rtt_ms: float | None) -> tuple[str, str]:
             return level, desc
     return "T1", "Sneaky — congested / long-haul"
 
+
+# ── Port preset lists ────────────────────────────────────────────────────────
+
+# ~24 ports that are most frequently found open in practice
+_PORTS_COMMON: list[int] = [
+    21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445,
+    1433, 1521, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 11211, 27017,
+]
+
+# ~1 100 ports: all well-known (1-1024) + frequently-found high ports
+_PORTS_TOP1000: list[int] = sorted(
+    set(range(1, 1025)) | {
+        1025, 1026, 1027, 1028, 1029, 1030, 1080, 1099, 1100, 1110, 1194,
+        1241, 1337, 1352, 1433, 1434, 1521, 1604, 1723, 1900, 1935, 1999,
+        2000, 2049, 2082, 2083, 2086, 2087, 2095, 2096, 2100, 2121, 2222,
+        2323, 2376, 2377, 2379, 2380, 2381, 2383, 2484, 2525, 2638, 3000,
+        3001, 3128, 3268, 3269, 3306, 3389, 3690, 4000, 4001, 4045, 4190,
+        4333, 4444, 4567, 4662, 4848, 4899, 4984, 5000, 5001, 5005, 5050,
+        5060, 5061, 5190, 5222, 5269, 5357, 5432, 5555, 5631, 5666, 5800,
+        5900, 5985, 5986, 6000, 6001, 6346, 6379, 6443, 6667, 6881, 7001,
+        7002, 7070, 7443, 7777, 7878, 8000, 8001, 8008, 8009, 8010, 8080,
+        8081, 8082, 8083, 8088, 8090, 8180, 8192, 8443, 8500, 8800, 8888,
+        8983, 9000, 9001, 9042, 9050, 9080, 9090, 9091, 9100, 9200, 9418,
+        9999, 10000, 10001, 10010, 10080, 10250, 10255, 11211, 11311, 12345,
+        15672, 16010, 16379, 20000, 22222, 27017, 27018, 27019, 28017, 30000,
+        32768, 37777, 49152, 49153, 49154, 49155, 49156, 49157, 50000, 50001,
+        50070, 55553, 60000, 61616, 62078, 65000,
+    }
+)
+
+# Categories excluded from the post-scan preset picker (we already know live
+# hosts and open ports, so port scans and host-discovery are redundant)
+_EXCLUDED_PRESET_CATS = {"Host Discovery", "Port Scanning"}
 
 # ── Follow-up nmap scan templates ────────────────────────────────────────────
 
@@ -184,16 +218,42 @@ class SmartScanView(ctk.CTkFrame):
 
         # Basic parameters (always visible)
         self._target_var     = tk.StringVar(value="192.168.1.0/24")
-        self._port_range_var = tk.StringVar(value="22,80,443,8080")
+        self._port_mode_var  = tk.StringVar(value="Common")
+        self._port_custom_var = tk.StringVar(value="22,80,443,8080")
         self._calib_host_var = tk.StringVar(value="8.8.8.8")
         self._calib_port_var = tk.IntVar(value=53)
 
         self._add_field(cfg_frame, "Target(s) (CIDR / IPv6 prefix / comma-separated IPs):", self._target_var,
             "e.g. 192.168.1.0/24, 10.0.0.1,10.0.0.2, or 2001:db8::/64.  "
             "The scanner probes every target IP × port combination.")
-        self._add_field(cfg_frame, "Ports to probe (comma-separated):", self._port_range_var,
-            "TCP/UDP ports checked on every host.  Examples: 22,80,443 for quick recon; "
-            "1-1024 for thorough coverage.")
+
+        # Port selector ───────────────────────────────────────────────────────
+        ctk.CTkLabel(cfg_frame, text="Ports to probe:", font=FONT_SMALL, anchor="w").pack(
+            fill="x", padx=PAD_S, pady=(PAD_S, 0))
+        ctk.CTkSegmentedButton(
+            cfg_frame,
+            values=["Top 1000", "Common", "All Ports", "Custom"],
+            variable=self._port_mode_var,
+            command=self._on_port_mode_change,
+        ).pack(fill="x", padx=PAD_S, pady=(2, 0))
+        ctk.CTkLabel(
+            cfg_frame,
+            text=(
+                "Top 1000: well-known ports + common services (~1 100 ports).  "
+                "Common: 24 frequently-open ports.  "
+                "All Ports: full 1–65 535 range (very slow).  "
+                "Custom: comma-separated numbers or ranges, e.g. 80,443,8000-8100."
+            ),
+            font=("Segoe UI", 9), text_color=TEXT_MUTED,
+            wraplength=310, justify="left", anchor="w",
+        ).pack(fill="x", padx=PAD_S, pady=(2, PAD_S))
+        # Custom entry container — always in pack order, content shown/hidden
+        self._port_custom_container = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        self._port_custom_container.pack(fill="x")
+        self._port_custom_entry = ctk.CTkEntry(
+            self._port_custom_container, textvariable=self._port_custom_var, font=FONT_SMALL,
+        )
+        # Hidden by default (mode starts at "Common")
         self._add_field(cfg_frame, "Calibration Host:", self._calib_host_var,
             "A reliable always-reachable host used to measure RTT and calibrate the probe "
             "rate.  Use 8.8.8.8 for internet scans or your LAN gateway for internal scans.")
@@ -424,6 +484,37 @@ class SmartScanView(ctk.CTkFrame):
             font=FONT_SMALL, text_color=TEXT_MUTED, anchor="w",
         ).pack(fill="x", padx=PAD, pady=(0, PAD))
 
+    # ── Port mode ─────────────────────────────────────────────────────────────
+
+    def _on_port_mode_change(self, mode: str) -> None:
+        if mode == "Custom":
+            self._port_custom_entry.pack(fill="x", padx=PAD_S, pady=(0, PAD_S))
+        else:
+            self._port_custom_entry.pack_forget()
+
+    def _get_ports(self) -> list[int]:
+        mode = self._port_mode_var.get()
+        if mode == "Top 1000":
+            return list(_PORTS_TOP1000)
+        if mode == "Common":
+            return list(_PORTS_COMMON)
+        if mode == "All Ports":
+            return list(range(1, 65536))
+        # Custom
+        raw = self._port_custom_var.get().strip()
+        ports: list[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if "-" in part:
+                try:
+                    a, b = part.split("-", 1)
+                    ports.extend(range(int(a), int(b) + 1))
+                except (ValueError, TypeError):
+                    pass
+            elif part.isdigit():
+                ports.append(int(part))
+        return ports or [80]
+
     # ── Advanced toggle ───────────────────────────────────────────────────────
 
     def _toggle_advanced(self) -> None:
@@ -498,10 +589,7 @@ class SmartScanView(ctk.CTkFrame):
 
     def _parse_targets(self) -> list[Endpoint]:
         raw = self._target_var.get().strip()
-        port_str = self._port_range_var.get().strip()
-        ports = [int(p) for p in port_str.split(",") if p.strip().isdigit()]
-        if not ports:
-            ports = [80]
+        ports = self._get_ports()
 
         _MAX_HOSTS = 65_534
         hosts: list[str] = []
@@ -748,112 +836,116 @@ class SmartScanView(ctk.CTkFrame):
         hosts_box.insert("end", "\n".join(unique_hosts) if unique_hosts else "(none)")
         hosts_box.configure(state="disabled")
 
-        # ── Right: nmap command builder ───────────────────────────────────────
+        # ── Right: preset picker ─────────────────────────────────────────────
         right = ctk.CTkFrame(popup, fg_color=BG_SECONDARY, corner_radius=CARD_CORNER)
         right.pack(side="right", fill="both", expand=True, padx=(PAD_S, PAD), pady=PAD)
 
-        ctk.CTkLabel(right, text="🎯 Configure Nmap Follow-up", font=FONT_H1, anchor="w").pack(
+        ctk.CTkLabel(right, text="🎯 Choose Follow-up Scan", font=FONT_H1, anchor="w").pack(
             fill="x", padx=PAD, pady=(PAD, PAD_S))
 
-        # Timing selector (pre-filled with recommendation)
-        ctk.CTkLabel(right, text="Timing Template:", font=FONT_SMALL, anchor="w").pack(
-            fill="x", padx=PAD)
-        timing_var = tk.StringVar(value=t_level)
-        ctk.CTkSegmentedButton(
-            right, values=["T1", "T2", "T3", "T4", "T5"], variable=timing_var,
-        ).pack(fill="x", padx=PAD, pady=(0, PAD_S))
-
-        # Scan type
-        ctk.CTkLabel(right, text="Scan Type:", font=FONT_SMALL, anchor="w").pack(
-            fill="x", padx=PAD)
-        scan_type_var = tk.StringVar(value=_HANDOFF_SCANS[0][0])
-        ctk.CTkOptionMenu(
+        # Context summary line
+        ports_summary = ", ".join(map(str, unique_ports[:6])) + ("…" if len(unique_ports) > 6 else "") or "none"
+        ctk.CTkLabel(
             right,
-            values=[s[0] for s in _HANDOFF_SCANS],
-            variable=scan_type_var,
+            text=(
+                f"{len(unique_hosts)} host(s) · ports {ports_summary} · "
+                f"timing -{t_level}  ({t_desc})"
+            ),
+            font=("Segoe UI", 9), text_color=TEXT_MUTED, anchor="w", wraplength=480,
         ).pack(fill="x", padx=PAD, pady=(0, PAD_S))
 
-        # Target (editable)
-        ctk.CTkLabel(right, text="Target:", font=FONT_SMALL, anchor="w").pack(fill="x", padx=PAD)
-        target_var = tk.StringVar(value=self._target_var.get().strip())
-        ctk.CTkEntry(right, textvariable=target_var, font=FONT_SMALL).pack(
-            fill="x", padx=PAD, pady=(0, PAD_S))
+        ctk.CTkFrame(right, height=1, fg_color="#2a4a6a").pack(fill="x", padx=PAD, pady=(0, PAD_S))
 
-        # Ports (editable, pre-filled from discovered ports)
-        ctk.CTkLabel(right, text="Ports:", font=FONT_SMALL, anchor="w").pack(fill="x", padx=PAD)
-        ports_default = (
-            ",".join(map(str, unique_ports))
-            if unique_ports
-            else self._port_range_var.get()
-        )
-        ports_var = tk.StringVar(value=ports_default)
-        ctk.CTkEntry(right, textvariable=ports_var, font=FONT_SMALL).pack(
-            fill="x", padx=PAD, pady=(0, PAD_S))
+        ctk.CTkLabel(
+            right,
+            text="Select a scan profile.  Port scans and host-discovery presets are hidden "
+                 "because ports and live hosts are already known.",
+            font=("Segoe UI", 9), text_color=TEXT_MUTED, anchor="w", wraplength=480,
+            justify="left",
+        ).pack(fill="x", padx=PAD, pady=(0, PAD_S))
 
-        # Command preview
-        ctk.CTkLabel(right, text="Command Preview:", font=FONT_SMALL, anchor="w").pack(
-            fill="x", padx=PAD)
-        cmd_box = ctk.CTkTextbox(right, font=FONT_MONO_SM, fg_color="#080e18",
-                                 text_color="#88ddaa", height=56)
-        cmd_box.pack(fill="x", padx=PAD, pady=(0, PAD_S))
+        # ── Helper: build nmap command from preset + discovered data ──────────
+        def _run_preset(preset: object) -> None:  # preset: ScanPreset
+            parts: list[str] = ["nmap", f"-{t_level}"]
+            if unique_ports:
+                parts.append(f"-p{','.join(map(str, unique_ports))}")
+            # Add preset flags, stripping -T? so we don't duplicate the timing
+            for flag in preset.flags:  # type: ignore[union-attr]
+                if not (flag.startswith("-T") and len(flag) == 3 and flag[2].isdigit()):
+                    parts.append(flag)
+            if preset.scripts:  # type: ignore[union-attr]
+                parts.append(f"--script={','.join(preset.scripts)}")  # type: ignore[union-attr]
+            if preset.script_args:  # type: ignore[union-attr]
+                parts.extend(["--script-args", ",".join(preset.script_args)])  # type: ignore[union-attr]
+            # Targets: discovered live hosts; fall back to config target
+            targets = unique_hosts if unique_hosts else [self._target_var.get().strip()]
+            parts.extend(targets)
+            cmd = " ".join(parts)
+            if self._on_run_nmap:
+                self._on_run_nmap(cmd)
+            popup.destroy()
 
-        _scan_map = dict(_HANDOFF_SCANS)
-        cmd_holder: list[str] = [""]
+        # ── Scrollable preset list ────────────────────────────────────────────
+        scroll = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=PAD_S, pady=(0, PAD_S))
 
-        def _rebuild_cmd(*_: object) -> None:
-            flags = _scan_map.get(scan_type_var.get(), "-sS -sV")
-            t = timing_var.get()
-            ports = ports_var.get().strip()
-            target = target_var.get().strip()
-            p_arg = f"-p {ports}" if ports else ""
-            cmd = f"nmap -{t} {p_arg} {flags} {target}".strip()
-            cmd_holder[0] = cmd
-            cmd_box.configure(state="normal")
-            cmd_box.delete("1.0", "end")
-            cmd_box.insert("end", cmd)
-            cmd_box.configure(state="disabled")
+        visible_presets = [
+            p for p in PRESET_CATALOGUE
+            if p.category not in _EXCLUDED_PRESET_CATS and not p.no_port_scan
+        ]
 
-        for v in (timing_var, scan_type_var, target_var, ports_var):
-            v.trace_add("write", _rebuild_cmd)
-        _rebuild_cmd()
+        current_cat: str | None = None
+        for preset in visible_presets:
+            # Category heading
+            if preset.category != current_cat:
+                current_cat = preset.category
+                ctk.CTkLabel(
+                    scroll,
+                    text=f"── {preset.category} ──",
+                    font=FONT_H2, text_color=ACCENT, anchor="w",
+                ).pack(fill="x", padx=PAD_S, pady=(PAD_S, 2))
 
-        # Action buttons ──────────────────────────────────────────────────────
+            # Preset card
+            card = ctk.CTkFrame(scroll, fg_color=BG_CARD, corner_radius=6)
+            card.pack(fill="x", padx=PAD_S, pady=2)
+            card.columnconfigure(0, weight=1)
+            card.columnconfigure(1, weight=0)
+
+            info = ctk.CTkFrame(card, fg_color="transparent")
+            info.grid(row=0, column=0, sticky="nsew", padx=PAD_S, pady=PAD_S)
+
+            name_row = ctk.CTkFrame(info, fg_color="transparent")
+            name_row.pack(fill="x")
+            ctk.CTkLabel(
+                name_row, text=preset.name, font=FONT_SMALL, anchor="w",
+            ).pack(side="left")
+            if preset.requires_root:
+                ctk.CTkLabel(
+                    name_row, text=" root ",
+                    font=("Segoe UI", 8), fg_color="#4a1a00",
+                    corner_radius=3, text_color="#ffaa44",
+                ).pack(side="left", padx=(PAD_S, 0))
+
+            desc = preset.description
+            if len(desc) > 110:
+                desc = desc[:107] + "…"
+            ctk.CTkLabel(
+                info, text=desc,
+                font=("Segoe UI", 9), text_color=TEXT_MUTED,
+                anchor="w", wraplength=340, justify="left",
+            ).pack(fill="x")
+
+            ctk.CTkButton(
+                card, text="▶  Run",
+                fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                corner_radius=BTN_CORNER, font=FONT_SMALL,
+                width=80,
+                command=lambda p=preset: _run_preset(p),
+            ).grid(row=0, column=1, sticky="e", padx=PAD_S, pady=PAD_S)
+
+        # ── Bottom: export + close ────────────────────────────────────────────
         btn_row = ctk.CTkFrame(right, fg_color="transparent")
-        btn_row.pack(fill="x", padx=PAD, pady=(PAD_S, PAD))
-
-        def _run_nmap() -> None:
-            if self._on_run_nmap and cmd_holder[0]:
-                self._on_run_nmap(cmd_holder[0])
-            popup.destroy()
-
-        def _copy_cmd() -> None:
-            self.clipboard_clear()
-            self.clipboard_append(cmd_holder[0])
-
-        def _view_dashboard() -> None:
-            if all_open:
-                self._on_hosts_discovered(all_open, final_rate)
-            popup.destroy()
-
-        ctk.CTkButton(
-            btn_row, text="▶  Run Nmap Scan",
-            fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            corner_radius=BTN_CORNER, command=_run_nmap,
-        ).pack(fill="x", pady=(0, PAD_S))
-        ctk.CTkButton(
-            btn_row, text="📊  View Results on Dashboard",
-            fg_color="#1a3a5a", hover_color="#2a4a6a",
-            corner_radius=BTN_CORNER, command=_view_dashboard,
-        ).pack(fill="x", pady=(0, PAD_S))
-        ctk.CTkButton(
-            btn_row, text="📋  Copy Command",
-            fg_color="#1a2a2a", hover_color="#2a4a3a",
-            corner_radius=BTN_CORNER, command=_copy_cmd,
-        ).pack(fill="x", pady=(0, PAD_S))
-
-        # Export buttons ──────────────────────────────────────────────────────
-        export_row = ctk.CTkFrame(btn_row, fg_color="transparent")
-        export_row.pack(fill="x", pady=(0, PAD_S))
+        btn_row.pack(fill="x", padx=PAD, pady=(0, PAD))
 
         def _export_json() -> None:
             import json as _json
@@ -903,18 +995,26 @@ class SmartScanView(ctk.CTkFrame):
                 _mb.showerror("Export Failed", str(exc))
 
         ctk.CTkButton(
-            export_row, text="💾  Export JSON",
+            btn_row, text="💾  Export JSON",
             fg_color="#1a3a2a", hover_color="#2a5a3a",
             corner_radius=BTN_CORNER, command=_export_json,
         ).pack(side="left", fill="x", expand=True, padx=(0, PAD_S))
         ctk.CTkButton(
-            export_row, text="📄  Export CSV",
+            btn_row, text="📄  Export CSV",
             fg_color="#1a3a2a", hover_color="#2a5a3a",
             corner_radius=BTN_CORNER, command=_export_csv,
-        ).pack(side="left", fill="x", expand=True)
-
+        ).pack(side="left", fill="x", expand=True, padx=(0, PAD_S))
+        ctk.CTkButton(
+            btn_row, text="📊  Dashboard Only",
+            fg_color="#1a3a5a", hover_color="#2a4a6a",
+            corner_radius=BTN_CORNER,
+            command=lambda: (
+                self._on_hosts_discovered(all_open, final_rate) if all_open else None,
+                popup.destroy(),
+            ),
+        ).pack(side="left", fill="x", expand=True, padx=(0, PAD_S))
         ctk.CTkButton(
             btn_row, text="Close",
             fg_color="transparent", hover_color="#2a2a3a",
             corner_radius=BTN_CORNER, command=popup.destroy,
-        ).pack(fill="x")
+        ).pack(side="left", fill="x", expand=True)
