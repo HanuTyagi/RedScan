@@ -1,17 +1,34 @@
 """
 LLM / AI Insights panel.
 
-Features:
-  • Provider selector: OpenAI, Gemini, Mock
-  • API key input with show/hide toggle
-  • "AI Insights" button – sanitises scan findings and sends to LLM
-  • "What's Next?" button – asks the LLM for recommended follow-up steps
-  • Result display with risk badge and recommendation list
+Layout
+──────
+┌─ 🤖 AI Insights ─────────────────────────────────── ⚙ Settings ─┐
+│                                                                    │
+│  ┌─ Review Prompt (edit before submitting) ──────────────────┐    │
+│  │  [full editable prompt text pre-populated from scan data] │    │
+│  └────────────────────────────────────────────────────────────┘   │
+│                                        [ ▶ Submit Analysis ]       │
+│                                                                    │
+│  ┌─ Risk Level ───────────────────────────────────────────────┐   │
+│  │  [ UNKNOWN ]  Provider: —                                  │   │
+│  └────────────────────────────────────────────────────────────┘   │
+│  ┌─ Summary & Recommendations ────────────────────────────────┐   │
+│  │  [result text…]                                            │   │
+│  └────────────────────────────────────────────────────────────┘   │
+│                                        [ 🗺 What's Next? ]         │
+│                                                                    │
+│  status bar                                                        │
+└────────────────────────────────────────────────────────────────────┘
+
+Settings (⚙ button → CTkToplevel dialog):
+  Provider selector, API key + show/hide, Model, Apply & Save.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import tkinter as tk
 from pathlib import Path
 from typing import Any
@@ -41,10 +58,13 @@ class OpenAIProvider(LLMProvider):
         return f"openai/{self._model}"
 
     async def analyze(self, request: LLMAnalysisRequest, context: str = "insights") -> LLMAnalysisResult:
+        prompt = _build_prompt(request, context=context)
+        return await self.analyze_raw(prompt)
+
+    async def analyze_raw(self, prompt: str) -> LLMAnalysisResult:
         try:
             import openai  # type: ignore[import]
             client = openai.AsyncOpenAI(api_key=self._key)
-            prompt = _build_prompt(request, context=context)
             resp = await client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "user", "content": prompt}],
@@ -71,11 +91,14 @@ class GeminiProvider(LLMProvider):
         return f"gemini/{self._model}"
 
     async def analyze(self, request: LLMAnalysisRequest, context: str = "insights") -> LLMAnalysisResult:
+        prompt = _build_prompt(request, context=context)
+        return await self.analyze_raw(prompt)
+
+    async def analyze_raw(self, prompt: str) -> LLMAnalysisResult:
         try:
             import google.generativeai as genai  # type: ignore[import]
             genai.configure(api_key=self._key)
             model = genai.GenerativeModel(self._model)
-            prompt = _build_prompt(request, context=context)
             # Run the synchronous SDK call in a thread pool so we don't block
             # the event loop.  asyncio.to_thread is available in Python 3.9+.
             resp = await asyncio.to_thread(model.generate_content, prompt)
@@ -187,147 +210,198 @@ def _parse_llm_response(raw: str, provider: str) -> LLMAnalysisResult:
 
 
 # ---------------------------------------------------------------------------
-# View
+# Settings dialog
 # ---------------------------------------------------------------------------
 
 _CONFIG_PATH = Path.home() / ".redscan_config.json"
 
 
-class LLMInsightsView(ctk.CTkFrame):
-    """LLM configuration and AI insights panel."""
+class _SettingsDialog(ctk.CTkToplevel):
+    """Modal dialog for LLM provider / API key / model configuration."""
 
-    def __init__(
-        self,
-        master: ctk.CTk | ctk.CTkFrame,
-    ) -> None:
-        super().__init__(master, fg_color="transparent")
-        self._hosts_data: list[dict[str, Any]] = []
-        self._command_used = ""
-        self._pipeline = LLMAnalysisPipeline()
+    def __init__(self, parent: ctk.CTkFrame, on_apply: Any) -> None:
+        super().__init__(parent)
+        self.title("LLM Settings")
+        self.geometry("420x300")
+        self.resizable(False, False)
+        self.grab_set()
+        self._on_apply = on_apply
         self._build()
-        # Defer config loading until the main event loop is running.
-        self.after(100, self._load_config)
-
-    # ── Build ────────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        self.columnconfigure(0, weight=0, minsize=320)
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        pad = PAD
 
-        # ── Left: settings ───────────────────────────────────────────────────
-        settings = ctk.CTkScrollableFrame(
-            self,
-            fg_color=BG_SECONDARY,
-            corner_radius=CARD_CORNER,
-            label_text="LLM Configuration",
+        ctk.CTkLabel(self, text="⚙  LLM Configuration", font=FONT_H2).grid(
+            row=0, column=0, sticky="w", padx=pad, pady=(pad, PAD_S)
         )
-        settings.grid(row=0, column=0, sticky="nsew", padx=(PAD, PAD_S), pady=PAD)
 
-        ctk.CTkLabel(settings, text="Provider", font=FONT_SMALL, anchor="w").pack(
-            fill="x", padx=PAD_S, pady=(PAD, 0)
+        ctk.CTkLabel(self, text="Provider", font=FONT_SMALL, anchor="w").grid(
+            row=1, column=0, sticky="w", padx=pad
         )
         self._provider_var = tk.StringVar(value="Mock (offline)")
         ctk.CTkComboBox(
-            settings,
+            self,
             values=["Mock (offline)", "OpenAI", "Gemini"],
             variable=self._provider_var,
             font=FONT_SMALL,
             command=self._on_provider_change,
-        ).pack(fill="x", padx=PAD_S, pady=(0, PAD))
+        ).grid(row=2, column=0, sticky="ew", padx=pad, pady=(0, PAD_S))
 
-        ctk.CTkLabel(settings, text="API Key", font=FONT_SMALL, anchor="w").pack(
-            fill="x", padx=PAD_S
+        ctk.CTkLabel(self, text="API Key", font=FONT_SMALL, anchor="w").grid(
+            row=3, column=0, sticky="w", padx=pad
         )
-        key_row = ctk.CTkFrame(settings, fg_color="transparent")
-        key_row.pack(fill="x", padx=PAD_S, pady=(0, PAD))
+        key_row = ctk.CTkFrame(self, fg_color="transparent")
+        key_row.grid(row=4, column=0, sticky="ew", padx=pad, pady=(0, PAD_S))
+        key_row.columnconfigure(0, weight=1)
 
         self._key_var = tk.StringVar()
         self._key_entry = ctk.CTkEntry(
             key_row, textvariable=self._key_var, show="•", font=FONT_SMALL
         )
-        self._key_entry.pack(side="left", fill="x", expand=True, padx=(0, PAD_S))
-
+        self._key_entry.grid(row=0, column=0, sticky="ew", padx=(0, PAD_S))
         ctk.CTkButton(
-            key_row,
-            text="👁",
-            width=30,
-            command=self._toggle_key_visibility,
-        ).pack(side="right")
+            key_row, text="👁", width=34,
+            command=self._toggle_key,
+        ).grid(row=0, column=1)
 
-        ctk.CTkLabel(settings, text="Model (optional)", font=FONT_SMALL, anchor="w").pack(
-            fill="x", padx=PAD_S
+        ctk.CTkLabel(self, text="Model  (leave blank for default)", font=FONT_SMALL, anchor="w").grid(
+            row=5, column=0, sticky="w", padx=pad
         )
         self._model_var = tk.StringVar(value="")
-        ctk.CTkEntry(settings, textvariable=self._model_var, placeholder_text="gpt-4o / gemini-1.5-flash", font=FONT_SMALL).pack(
-            fill="x", padx=PAD_S, pady=(0, PAD)
-        )
-
-        ctk.CTkButton(
-            settings,
-            text="✅  Apply Configuration",
-            fg_color="#1a4a1a",
-            hover_color="#2a6a2a",
-            corner_radius=BTN_CORNER,
-            command=self._apply_config,
-        ).pack(fill="x", padx=PAD_S, pady=PAD)
-
-        ctk.CTkFrame(settings, height=1, fg_color="#2a4a2a").pack(fill="x", padx=PAD_S, pady=PAD)
-
-        # Context display
-        ctk.CTkLabel(settings, text="Scan Context", font=FONT_H2, anchor="w").pack(
-            fill="x", padx=PAD_S, pady=(0, PAD_S)
-        )
-        self._ctx_label = ctk.CTkLabel(
-            settings,
-            text="No scan data loaded.\nRun a scan in the Dashboard first.",
+        ctk.CTkEntry(
+            self, textvariable=self._model_var,
+            placeholder_text="gpt-4o / gemini-1.5-flash",
             font=FONT_SMALL,
-            text_color=TEXT_MUTED,
-            wraplength=280,
-            justify="left",
-            anchor="w",
-        )
-        self._ctx_label.pack(fill="x", padx=PAD_S)
-
-        ctk.CTkFrame(settings, height=1, fg_color="#2a4a2a").pack(fill="x", padx=PAD_S, pady=PAD)
+        ).grid(row=6, column=0, sticky="ew", padx=pad, pady=(0, PAD))
 
         ctk.CTkButton(
-            settings,
-            text="🔍  AI Insights",
-            fg_color="#4a1a6a",
-            hover_color="#6a2a8a",
+            self, text="✅  Apply & Save",
+            fg_color="#1a4a1a", hover_color="#2a6a2a",
             corner_radius=BTN_CORNER,
-            command=self._run_insights,
-        ).pack(fill="x", padx=PAD_S, pady=(0, PAD_S))
+            command=self._apply,
+        ).grid(row=7, column=0, sticky="ew", padx=pad, pady=(0, pad))
 
-        ctk.CTkButton(
-            settings,
-            text="🗺  What's Next?",
-            fg_color="#1a3a5a",
-            hover_color="#2a5a7a",
-            corner_radius=BTN_CORNER,
-            command=self._run_next_steps,
-        ).pack(fill="x", padx=PAD_S, pady=(0, PAD))
+    def _on_provider_change(self, _: str) -> None:
+        is_api = self._provider_var.get() != "Mock (offline)"
+        self._key_entry.configure(state="normal" if is_api else "disabled")
 
-        # ── Right: results ────────────────────────────────────────────────────
-        results_pane = ctk.CTkFrame(self, fg_color="transparent")
-        results_pane.grid(row=0, column=1, sticky="nsew", padx=(0, PAD), pady=PAD)
-        results_pane.rowconfigure(0, weight=0)
-        results_pane.rowconfigure(1, weight=0)
-        results_pane.rowconfigure(2, weight=1)
-        results_pane.columnconfigure(0, weight=1)
+    def _toggle_key(self) -> None:
+        cur = self._key_entry.cget("show")
+        self._key_entry.configure(show="" if cur == "•" else "•")
 
-        ctk.CTkLabel(results_pane, text="AI Analysis", font=FONT_H1, anchor="w").grid(
-            row=0, column=0, sticky="w", pady=(0, PAD_S)
+    def _apply(self) -> None:
+        self._on_apply(
+            self._provider_var.get(),
+            self._key_var.get().strip(),
+            self._model_var.get().strip(),
         )
+        self.destroy()
+
+    # Called by LLMInsightsView to pre-populate fields from saved config.
+    def set_values(self, provider: str, key: str, model: str) -> None:
+        if provider in ("Mock (offline)", "OpenAI", "Gemini"):
+            self._provider_var.set(provider)
+            self._on_provider_change(provider)
+        self._key_var.set(key)
+        self._model_var.set(model)
+
+
+# ---------------------------------------------------------------------------
+# Main view
+# ---------------------------------------------------------------------------
+
+class LLMInsightsView(ctk.CTkFrame):
+    """AI insights panel.
+
+    The main area shows a pre-built, editable prompt (populated when the
+    Dashboard sends scan context) and the LLM results.  Provider/key settings
+    are tucked away in a ⚙ Settings dialog to keep the main view clean.
+    """
+
+    def __init__(self, master: ctk.CTk | ctk.CTkFrame) -> None:
+        super().__init__(master, fg_color="transparent")
+        self._hosts_data: list[dict[str, Any]] = []
+        self._command_used = ""
+        self._pipeline = LLMAnalysisPipeline()
+        # Saved config state (used to pre-populate the settings dialog).
+        self._cfg_provider = "Mock (offline)"
+        self._cfg_key = ""
+        self._cfg_model = ""
+        self._build()
+        self.after(100, self._load_config)
+
+    # ── Build ────────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=0)  # prompt section
+        self.rowconfigure(2, weight=1)  # results section
+        self.rowconfigure(3, weight=0)  # status bar
+
+        # ── Row 0: header ────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(PAD, 0))
+        hdr.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(hdr, text="🤖  AI Insights", font=FONT_H1, anchor="w").grid(
+            row=0, column=0, sticky="w"
+        )
+        ctk.CTkButton(
+            hdr, text="⚙  Settings",
+            fg_color=BG_SECONDARY, hover_color="#2a3a4a",
+            corner_radius=BTN_CORNER,
+            command=self._open_settings,
+        ).grid(row=0, column=1)
+
+        # ── Row 1: prompt review area ────────────────────────────────────────
+        prompt_frame = ctk.CTkFrame(self, fg_color=BG_SECONDARY, corner_radius=CARD_CORNER)
+        prompt_frame.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(PAD_S, 0))
+        prompt_frame.columnconfigure(0, weight=1)
+
+        prompt_hdr = ctk.CTkFrame(prompt_frame, fg_color="transparent")
+        prompt_hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=PAD_S, pady=(PAD_S, 0))
+        prompt_hdr.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            prompt_hdr, text="Review Prompt",
+            font=FONT_H2, anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            prompt_hdr,
+            text="Edit the prompt before submitting — changes are reflected in the LLM call.",
+            font=FONT_SMALL, text_color=TEXT_MUTED, anchor="w",
+        ).grid(row=1, column=0, sticky="w")
+
+        self._prompt_text = ctk.CTkTextbox(
+            prompt_frame,
+            font=FONT_MONO_SM,
+            fg_color="#0a1020",
+            text_color="#aaddaa",
+            height=160,
+        )
+        self._prompt_text.grid(row=1, column=0, sticky="ew", padx=PAD_S, pady=PAD_S)
+
+        self._submit_btn = ctk.CTkButton(
+            prompt_frame,
+            text="▶  Submit Analysis",
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            corner_radius=BTN_CORNER,
+            state="disabled",
+            command=self._run_submit,
+        )
+        self._submit_btn.grid(row=2, column=0, sticky="e", padx=PAD_S, pady=(0, PAD_S))
+
+        # ── Row 2: results ───────────────────────────────────────────────────
+        results_outer = ctk.CTkFrame(self, fg_color="transparent")
+        results_outer.grid(row=2, column=0, sticky="nsew", padx=PAD, pady=PAD_S)
+        results_outer.columnconfigure(0, weight=1)
+        results_outer.rowconfigure(1, weight=1)
 
         # Risk banner
-        self._risk_frame = ctk.CTkFrame(
-            results_pane, fg_color=BG_CARD, corner_radius=CARD_CORNER
-        )
-        self._risk_frame.grid(row=1, column=0, sticky="ew", pady=(0, PAD))
-
-        risk_inner = ctk.CTkFrame(self._risk_frame, fg_color="transparent")
+        risk_frame = ctk.CTkFrame(results_outer, fg_color=BG_CARD, corner_radius=CARD_CORNER)
+        risk_frame.grid(row=0, column=0, sticky="ew", pady=(0, PAD_S))
+        risk_inner = ctk.CTkFrame(risk_frame, fg_color="transparent")
         risk_inner.pack(fill="x", padx=PAD, pady=PAD_S)
 
         ctk.CTkLabel(risk_inner, text="Risk Level", font=FONT_SMALL, text_color=TEXT_MUTED).pack(
@@ -342,7 +416,6 @@ class LLMInsightsView(ctk.CTkFrame):
             corner_radius=4,
         )
         self._risk_badge.pack(side="left", padx=PAD)
-
         ctk.CTkLabel(risk_inner, text="Provider:", font=FONT_SMALL, text_color=TEXT_MUTED).pack(
             side="left", padx=(PAD, 0)
         )
@@ -350,45 +423,57 @@ class LLMInsightsView(ctk.CTkFrame):
         self._provider_label.pack(side="left")
 
         # Summary text
-        summary_frame = ctk.CTkFrame(results_pane, fg_color=BG_SECONDARY, corner_radius=CARD_CORNER)
-        summary_frame.grid(row=2, column=0, sticky="nsew")
+        summary_frame = ctk.CTkFrame(results_outer, fg_color=BG_SECONDARY, corner_radius=CARD_CORNER)
+        summary_frame.grid(row=1, column=0, sticky="nsew")
         summary_frame.rowconfigure(1, weight=1)
         summary_frame.columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(summary_frame, text="Summary & Recommendations", font=FONT_H2, anchor="w").grid(
-            row=0, column=0, padx=PAD, pady=PAD_S, sticky="w"
+        sum_hdr = ctk.CTkFrame(summary_frame, fg_color="transparent")
+        sum_hdr.grid(row=0, column=0, sticky="ew", padx=PAD, pady=PAD_S)
+        sum_hdr.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            sum_hdr, text="Summary & Recommendations", font=FONT_H2, anchor="w"
+        ).grid(row=0, column=0, sticky="w")
+
+        self._whats_next_btn = ctk.CTkButton(
+            sum_hdr,
+            text="🗺  What's Next?",
+            fg_color="#1a3a5a", hover_color="#2a5a7a",
+            corner_radius=BTN_CORNER,
+            state="disabled",
+            command=self._run_next_steps,
         )
+        self._whats_next_btn.grid(row=0, column=1)
+
         self._result_text = ctk.CTkTextbox(
             summary_frame,
             font=FONT_BODY,
             fg_color="#0a1020",
             text_color="#ddddee",
         )
-        self._result_text.grid(row=1, column=0, sticky="nsew", padx=PAD_S, pady=(0, PAD_S))
+        self._result_text.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=PAD_S, pady=(0, PAD_S))
 
-        self._status_var = tk.StringVar(value="Configure a provider and run a scan first.")
+        # ── Row 3: status bar ────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="Run a scan in the Dashboard, then click 🤖 AI Insights.")
         ctk.CTkLabel(
             self,
             textvariable=self._status_var,
             font=FONT_SMALL,
             text_color=TEXT_MUTED,
             anchor="w",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=PAD, pady=(0, PAD))
+        ).grid(row=3, column=0, sticky="ew", padx=PAD, pady=(0, PAD_S))
 
-    # ── Config ────────────────────────────────────────────────────────────────
+    # ── Settings ─────────────────────────────────────────────────────────────
 
-    def _on_provider_change(self, _: str) -> None:
-        is_api = self._provider_var.get() != "Mock (offline)"
-        self._key_entry.configure(state="normal" if is_api else "disabled")
+    def _open_settings(self) -> None:
+        dlg = _SettingsDialog(self, on_apply=self._apply_config)
+        dlg.set_values(self._cfg_provider, self._cfg_key, self._cfg_model)
 
-    def _toggle_key_visibility(self) -> None:
-        cur = self._key_entry.cget("show")
-        self._key_entry.configure(show="" if cur == "•" else "•")
-
-    def _apply_config(self) -> None:
-        provider_name = self._provider_var.get()
-        key = self._key_var.get().strip()
-        model = self._model_var.get().strip()
+    def _apply_config(self, provider_name: str, key: str, model: str) -> None:
+        self._cfg_provider = provider_name
+        self._cfg_key = key
+        self._cfg_model = model
 
         if provider_name == "OpenAI":
             prov: LLMProvider = OpenAIProvider(key, model or "gpt-4o")
@@ -402,47 +487,65 @@ class LLMInsightsView(ctk.CTkFrame):
         self._save_config(provider_name, key, model)
 
     def _load_config(self) -> None:
-        """Load saved provider / API key / model from ~/.redscan_config.json."""
         if not _CONFIG_PATH.exists():
             return
         try:
             cfg: dict[str, Any] = json.loads(_CONFIG_PATH.read_text())
         except (OSError, json.JSONDecodeError):
             return
-        provider = cfg.get("provider", "")
+        provider = cfg.get("provider", "Mock (offline)")
         key = cfg.get("api_key", "")
         model = cfg.get("model", "")
-        if provider in ("OpenAI", "Gemini", "Mock (offline)"):
-            self._provider_var.set(provider)
-            self._on_provider_change(provider)
-        if key:
-            self._key_var.set(key)
-        if model:
-            self._model_var.set(model)
-        # Apply the restored configuration so the pipeline is ready immediately.
-        # Without this call the panel would show the correct provider/key in the
-        # UI but self._pipeline would still be the default MockLLMProvider, and
-        # users would receive mock results until they manually clicked "Apply".
-        self._apply_config()
+        self._apply_config(provider, key, model)
 
     def _save_config(self, provider: str, key: str, model: str) -> None:
-        """Persist provider / API key / model to ~/.redscan_config.json."""
         try:
             _CONFIG_PATH.write_text(
                 json.dumps({"provider": provider, "api_key": key, "model": model}, indent=2)
             )
         except OSError:
-            pass  # Non-fatal
+            pass
 
     # ── Context loading ──────────────────────────────────────────────────────
 
     def load_context(self, hosts: list[Any], command: str) -> None:
-        """Called by the dashboard after a scan completes."""
+        """Called by the dashboard after a scan completes (or by the command
+        factory to explain a command).  Pre-populates the editable prompt box."""
         self._hosts_data = [h.to_dict() if hasattr(h, "to_dict") else h for h in hosts]
         self._command_used = command
-        summary = f"{len(hosts)} host(s) loaded.\nCommand: {command[:80]}"
-        self._ctx_label.configure(text=summary)
-        self._status_var.set("Context loaded — click AI Insights or What's Next?")
+
+        # Build the full prompt and populate the editable textbox.
+        if self._hosts_data:
+            req = self._build_request()
+            prompt_text = _build_prompt(req, context="insights")
+        elif command:
+            # Command-factory "Explain" path: no scan data, just explain the command.
+            prompt_text = (
+                f"You are a network security expert.\n"
+                f"Explain the following nmap command in plain English, covering what it does, "
+                f"what each flag means, and what the expected output would include:\n\n"
+                f"  {command}\n\n"
+                "Be clear and concise."
+            )
+        else:
+            prompt_text = ""
+
+        self._prompt_text.configure(state="normal")
+        self._prompt_text.delete("1.0", "end")
+        if prompt_text:
+            self._prompt_text.insert("end", prompt_text)
+
+        # Enable/disable submit based on whether there is something to send.
+        self._submit_btn.configure(state="normal" if prompt_text else "disabled")
+        # "What's Next?" resets until the user submits and gets a result.
+        self._whats_next_btn.configure(state="disabled")
+
+        ctx_hint = (
+            f"{len(hosts)} host(s) loaded — review the prompt and click Submit."
+            if hosts
+            else "Command loaded — review the prompt and click Submit."
+        )
+        self._status_var.set(ctx_hint)
 
     # ── Analysis ─────────────────────────────────────────────────────────────
 
@@ -469,32 +572,32 @@ class LLMInsightsView(ctk.CTkFrame):
             nmap_command=self._command_used,
         )
 
-    def _run_insights(self) -> None:
-        if not self._hosts_data:
-            self._status_var.set("No scan data – run a scan from the Dashboard first.")
+    def _run_submit(self) -> None:
+        """Read the (possibly edited) prompt and send it to the LLM."""
+        prompt = self._prompt_text.get("1.0", "end").strip()
+        if not prompt:
+            self._status_var.set("Prompt is empty — add scan context first.")
             return
+        self._submit_btn.configure(state="disabled")
+        self._whats_next_btn.configure(state="disabled")
         self._status_var.set("Analysing…")
-        req = self._build_request()
-        import threading
-        threading.Thread(target=self._async_insights, args=(req, "insights"), daemon=True).start()
+        threading.Thread(target=self._async_raw, args=(prompt,), daemon=True).start()
 
     def _run_next_steps(self) -> None:
+        """Build and immediately send a follow-up next-steps prompt."""
         if not self._hosts_data:
-            self._status_var.set("No scan data – run a scan from the Dashboard first.")
+            self._status_var.set("No scan data available for follow-up.")
             return
-        self._status_var.set("Generating next-steps guidance…")
         req = self._build_request()
-        import threading
-        threading.Thread(target=self._async_insights, args=(req, "next_steps"), daemon=True).start()
+        prompt = _build_prompt(req, context="next_steps")
+        self._whats_next_btn.configure(state="disabled")
+        self._status_var.set("Generating next-steps guidance…")
+        threading.Thread(target=self._async_raw, args=(prompt,), daemon=True).start()
 
-    def _async_insights(self, req: LLMAnalysisRequest, context: str) -> None:
+    def _async_raw(self, prompt: str) -> None:
         loop = asyncio.new_event_loop()
         try:
-            # Pass context all the way to the provider so it receives the
-            # correct prompt.  Previously the next-steps prompt was built but
-            # never forwarded; the pipeline always received the default
-            # "insights" context, so "What's Next?" never worked.
-            result = loop.run_until_complete(self._pipeline.run(req, context=context))
+            result = loop.run_until_complete(self._pipeline.run_raw(prompt))
         finally:
             loop.close()
         self.after(0, self._display_result, result)
@@ -520,3 +623,8 @@ class LLMInsightsView(ctk.CTkFrame):
             self._result_text.insert("end", f"{i}. {rec}\n")
 
         self._status_var.set(f"Analysis complete — provider: {result.provider}")
+        # Re-enable buttons now that the analysis is done.
+        self._submit_btn.configure(state="normal")
+        if self._hosts_data:
+            self._whats_next_btn.configure(state="normal")
+
