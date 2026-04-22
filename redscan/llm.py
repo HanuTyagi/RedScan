@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Callable
 
 from .models import LLMAnalysisRequest, LLMAnalysisResult
+
+# Callback type for streaming tokens: receives one text chunk at a time.
+TokenCallback = Callable[[str], None] | None
 
 
 class LLMProvider(ABC):
@@ -26,17 +30,40 @@ class LLMProvider(ABC):
             recommendations=[],
         )
 
+    async def stream_raw(
+        self,
+        prompt: str,
+        history: list[dict[str, str]] | None = None,
+        on_token: TokenCallback = None,
+        system_prompt: str = "",
+    ) -> LLMAnalysisResult:
+        """Stream *prompt* to the LLM, calling *on_token* for each chunk.
+
+        Default falls back to non-streaming ``analyze_raw`` so subclasses only
+        need to override when they support real streaming.
+        """
+        result = await self.analyze_raw(prompt)
+        if on_token is not None:
+            on_token(result.summary)
+        return result
+
 
 class MockLLMProvider(LLMProvider):
     @property
     def name(self) -> str:
         return "mock"
 
-    async def analyze_raw(self, prompt: str) -> LLMAnalysisResult:
-        """Return a mock result for any raw prompt."""
+    async def stream_raw(
+        self,
+        prompt: str,
+        history: list[dict[str, str]] | None = None,
+        on_token: TokenCallback = None,
+        system_prompt: str = "",
+    ) -> LLMAnalysisResult:
+        """Return a mock result for any raw prompt, simulating a stream."""
         is_next_steps = "follow-up" in prompt.lower() or "what" in prompt.lower()
         if is_next_steps:
-            return LLMAnalysisResult(
+            result = LLMAnalysisResult(
                 provider=self.name,
                 summary="Mock next-steps: deepen service enumeration and check for default credentials.",
                 risk_level="medium",
@@ -46,16 +73,23 @@ class MockLLMProvider(LLMProvider):
                     "Check for default credentials on exposed management services.",
                 ],
             )
-        return LLMAnalysisResult(
-            provider=self.name,
-            summary="Mock analysis: review the prompt above and configure a real provider for live results.",
-            risk_level="medium",
-            recommendations=[
-                "Configure OpenAI or Gemini in ⚙ Settings for real analysis.",
-                "Validate service versions detected in the scan.",
-                "Review least-privilege network access policies.",
-            ],
-        )
+        else:
+            result = LLMAnalysisResult(
+                provider=self.name,
+                summary="Mock analysis: review the prompt above and configure a real provider for live results.\nConfidence: 42",
+                risk_level="medium",
+                recommendations=[
+                    "Configure OpenAI or Gemini in ⚙ Settings for real analysis.",
+                    "Validate service versions detected in the scan.",
+                    "Review least-privilege network access policies.",
+                ],
+            )
+        if on_token is not None:
+            on_token(result.summary + "\n\n")
+            for i, rec in enumerate(result.recommendations, 1):
+                on_token(f"{i}. {rec}\n")
+            on_token("\nConfidence: 42")
+        return result
 
     async def analyze(self, request: LLMAnalysisRequest, context: str = "insights") -> LLMAnalysisResult:
         high_risk_ports = {21, 23, 445, 3389}
@@ -122,3 +156,18 @@ class LLMAnalysisPipeline:
     async def run_raw(self, prompt: str) -> LLMAnalysisResult:
         """Send *prompt* verbatim to the configured provider."""
         return await self.provider.analyze_raw(prompt)
+
+    async def stream_raw(
+        self,
+        prompt: str,
+        history: list[dict[str, str]] | None = None,
+        on_token: TokenCallback = None,
+        system_prompt: str = "",
+    ) -> LLMAnalysisResult:
+        """Stream *prompt* through the configured provider."""
+        return await self.provider.stream_raw(
+            prompt,
+            history=history,
+            on_token=on_token,
+            system_prompt=system_prompt,
+        )
