@@ -178,6 +178,23 @@ DEFAULT_RULES: list[ConflictRule] = [
     ),
 
     ConflictRule(
+        name="host_discovery_removes_embedded_port_flags",
+        check=lambda cmd, target, ports, root: (
+            _has_flag(cmd, "-sn") and _has_flag(cmd, "-p", "-p-", "-F", "--top-ports")
+        ),
+        severity="auto_fix",
+        message=lambda cmd, target, ports, root: (
+            "[!] AUTO-FIX: '-sn' disables port scanning.  Embedded port-selection "
+            "flags ('-p'/'-p-'/'-F'/'--top-ports') were removed."
+        ),
+        fix=lambda cmd: _remove_tokens(
+            _remove_flags(cmd, "-p", "--top-ports"),
+            "-p-",
+            "-F",
+        ),
+    ),
+
+    ConflictRule(
         name="sn_plus_sv_incompatible",
         check=lambda cmd, target, ports, root: (
             _has_flag(cmd, "-sn") and _has_flag(cmd, "-sV")
@@ -299,12 +316,12 @@ DEFAULT_RULES: list[ConflictRule] = [
         check=lambda cmd, target, ports, root: (
             not root and bool(_RAW_SOCKET_FLAGS & _flags(cmd))
         ),
-        severity="warning",
+        severity="error",
         message=lambda cmd, target, ports, root: (
-            "[!] PRIVILEGE WARNING: "
+            "[✖] ERROR: "
             + ", ".join(sorted(_RAW_SOCKET_FLAGS & _flags(cmd)))
-            + " require root / Administrator privileges.  Nmap may fall back "
-            "to a TCP Connect scan or fail — run as root for full functionality."
+            + " require root / Administrator privileges.  This scan is blocked. "
+            "Run RedScan with elevated privileges or choose a non-raw scan profile."
         ),
     ),
 
@@ -613,4 +630,3 @@ class ConflictManager:
         if flags & _SELF_PORTING_FLAGS:
             return False
         return True
-

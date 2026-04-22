@@ -118,6 +118,7 @@ class DashboardView(ctk.CTkFrame):
         self._poll_events()
         # Defer user preset loading until the event loop is running.
         self.after(200, self._load_user_presets)
+        self.after(250, self._refresh_ports_gate)
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -139,6 +140,7 @@ class DashboardView(ctk.CTkFrame):
 
         preset_keys = ["(none)"] + [p.key for p in PRESET_CATALOGUE]
         self._preset_var = tk.StringVar(value="(none)")
+        self._preset_var.trace_add("write", lambda *_: self._refresh_ports_gate())
         ctk.CTkLabel(ctrl, text="Preset:", font=FONT_SMALL).pack(side="left")
         self._preset_combo = ctk.CTkComboBox(
             ctrl,
@@ -151,9 +153,10 @@ class DashboardView(ctk.CTkFrame):
 
         ctk.CTkLabel(ctrl, text="Ports:", font=FONT_SMALL).pack(side="left")
         self._ports_var = tk.StringVar(value="1-1024")
-        ctk.CTkEntry(ctrl, textvariable=self._ports_var, width=120, font=FONT_SMALL).pack(
-            side="left", padx=(PAD_S, PAD)
-        )
+        self._ports_entry = ctk.CTkEntry(ctrl, textvariable=self._ports_var, width=120, font=FONT_SMALL)
+        self._ports_entry.pack(side="left", padx=(PAD_S, PAD))
+        self._ports_status_lbl = ctk.CTkLabel(ctrl, text="", font=FONT_SMALL, text_color=TEXT_MUTED)
+        self._ports_status_lbl.pack(side="left", padx=(0, PAD))
 
         self._run_btn = ctk.CTkButton(
             ctrl, text="▶  Run Scan",
@@ -361,7 +364,7 @@ class DashboardView(ctk.CTkFrame):
         # Conflict rule: -sn (host-discovery-only) has no port-scan phase.
         # Silently drop the port specification; _log_preflight_warnings() will
         # tell the user what happened.
-        if ports_str and "-sn" not in cmd:
+        if ports_str and ConflictManager.needs_ports_input(cmd):
             cmd.extend(["-p", ports_str])
 
         # Write XML to a temp file in addition to the default text output.
@@ -378,6 +381,36 @@ class DashboardView(ctk.CTkFrame):
         # and those regexes would never match, leaving the dashboard empty.
         cmd.append(target)
         return cmd
+
+    def _refresh_ports_gate(self) -> None:
+        """Disable Ports input when active scan flags already define port scope."""
+        preset_key = self._preset_var.get()
+        preset = get_by_key(preset_key) if preset_key != "(none)" else None
+        cmd: list[str] = ["nmap"]
+        if preset:
+            cmd.extend(preset.flags)
+        else:
+            cmd.extend(["-sT", "-sV", "-T4"])
+
+        if ConflictManager.needs_ports_input(cmd):
+            self._ports_entry.configure(state="normal", text_color=TEXT_PRIMARY)
+            self._ports_status_lbl.configure(text="")
+            return
+
+        flags = set(cmd)
+        if "-sn" in flags:
+            reason = "disabled — ping-only scan"
+        elif "-p-" in flags:
+            reason = "disabled — all 65535 ports"
+        elif "-F" in flags:
+            reason = "disabled — top-100 ports"
+        elif "--top-ports" in flags:
+            reason = "disabled — --top-ports set"
+        else:
+            reason = "disabled"
+
+        self._ports_entry.configure(state="disabled", text_color="#777")
+        self._ports_status_lbl.configure(text=f"({reason})")
 
     @staticmethod
     def _new_xml_tempfile() -> str | None:
@@ -807,6 +840,7 @@ class DashboardView(ctk.CTkFrame):
         """Public API: select a preset by key. Used by app.py to avoid
         reaching into private widget state."""
         self._preset_var.set(preset_key)
+        self._refresh_ports_gate()
 
     def start_scan(self) -> None:
         """Public API: start a scan with the current target / preset / ports.
@@ -833,15 +867,29 @@ class DashboardView(ctk.CTkFrame):
         self._target_var.set(target)
         self._preset_var.set("(none)")
         self._ports_var.set("")
+        self._refresh_ports_gate()
         self._hosts.clear()
         self._host_listbox.delete(0, "end")
         self._log_text.delete("1.0", "end")
         self._running = True
         self._run_btn.configure(state="disabled")
-        self._command_used = command_str
-        self._log(f"[*] Command Factory → {command_str}\n")
+        # Route command-factory commands through ConflictManager as well.
+        clean_cmd, preflight_msgs = self._log_preflight_warnings(parts)
+        if ConflictManager.has_errors(preflight_msgs):
+            error_texts = [text for sev, text in preflight_msgs if sev == "error"]
+            self._running = False
+            self._run_btn.configure(state="normal")
+            self._status_var.set("Scan blocked — fix errors first.")
+            _error_dialog(
+                self,
+                "Scan Blocked — Error Detected",
+                "\n\n".join(error_texts),
+            )
+            return
+        self._command_used = " ".join(clean_cmd)
+        self._log(f"[*] Command Factory → {self._command_used}\n")
         self._status_var.set("Scanning…")
-        threading.Thread(target=self._scan_worker, args=(parts,), daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=(clean_cmd,), daemon=True).start()
 
     def load_from_smart_scan(
         self, endpoints: list[dict[str, Any]], rate: float
