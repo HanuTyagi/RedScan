@@ -662,8 +662,9 @@ class _CompareDialog(ctk.CTkToplevel):
         self,
         parent: ctk.CTkFrame,
         prompt: str,
-        primary_result: str,
         primary_name: str,
+        primary_key: str,
+        primary_model: str,
         history: list[dict[str, str]],
         system_prompt: str,
         cmp_provider_name: str,
@@ -676,17 +677,20 @@ class _CompareDialog(ctk.CTkToplevel):
         self._prompt = prompt
         self._history = history
         self._system_prompt = system_prompt
+        self._primary_name = primary_name
+        self._primary_key = primary_key
+        self._primary_model = primary_model
         self._cmp_provider_name = cmp_provider_name
         self._cmp_key = cmp_key
-        self._build(primary_result, primary_name)
+        self._build()
 
-    def _build(self, primary_result: str, primary_name: str) -> None:
+    def _build(self) -> None:
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(1, weight=1)
 
         # Headers
-        ctk.CTkLabel(self, text=f"Provider 1: {primary_name}", font=FONT_H2, anchor="w").grid(
+        ctk.CTkLabel(self, text=f"Provider 1: {self._primary_name}", font=FONT_H2, anchor="w").grid(
             row=0, column=0, sticky="w", padx=PAD, pady=(PAD, PAD_S)
         )
         self._p2_label = ctk.CTkLabel(
@@ -697,37 +701,37 @@ class _CompareDialog(ctk.CTkToplevel):
         # Text boxes
         self._box1 = ctk.CTkTextbox(self, font=FONT_SMALL, fg_color="#0a1020")
         self._box1.grid(row=1, column=0, sticky="nsew", padx=(PAD, PAD_S), pady=(0, PAD_S))
-        self._box1.insert("end", primary_result)
-        self._box1.configure(state="disabled")
+        self._box1.insert("end", "Running…")
 
         self._box2 = ctk.CTkTextbox(self, font=FONT_SMALL, fg_color="#0a1020")
         self._box2.grid(row=1, column=1, sticky="nsew", padx=(PAD_S, PAD), pady=(0, PAD_S))
         self._box2.insert("end", "Running…")
 
-        # Run compare in background
+        # Run compare in background (both providers stream concurrently)
         threading.Thread(target=self._run_compare, daemon=True).start()
 
-    def _run_compare(self) -> None:
-        from gui.views.llm_panel import OpenAIProvider, GeminiProvider
+    @staticmethod
+    def _provider_from_name(name: str, key: str, model: str = "") -> LLMProvider:
+        if name == "OpenAI":
+            return OpenAIProvider(key, model or "gpt-4o")
+        if name == "Gemini":
+            return GeminiProvider(key, model or "gemini-1.5-flash")
+        return MockLLMProvider()
 
-        pname = self._cmp_provider_name
-        if pname == "OpenAI":
-            prov: LLMProvider = OpenAIProvider(self._cmp_key)
-        elif pname == "Gemini":
-            prov = GeminiProvider(self._cmp_key)
-        else:
-            prov = MockLLMProvider()
-
+    def _run_one(self, provider: LLMProvider, box_idx: int) -> None:
         collected: list[str] = []
 
         def on_token(tok: str) -> None:
             collected.append(tok)
-            self.after(0, self._append_token, tok)
+            if box_idx == 1:
+                self.after(0, self._append_token_box1, tok)
+            else:
+                self.after(0, self._append_token, tok)
 
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(
-                prov.stream_raw(
+                provider.stream_raw(
                     self._prompt,
                     history=self._history,
                     on_token=on_token,
@@ -736,7 +740,29 @@ class _CompareDialog(ctk.CTkToplevel):
             )
         finally:
             loop.close()
+
+    def _run_compare(self) -> None:
+        primary_provider = self._provider_from_name(
+            self._primary_name,
+            self._primary_key,
+            self._primary_model,
+        )
+        cmp_provider = self._provider_from_name(self._cmp_provider_name, self._cmp_key)
+
+        t1 = threading.Thread(target=self._run_one, args=(primary_provider, 1), daemon=True)
+        t2 = threading.Thread(target=self._run_one, args=(cmp_provider, 2), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
         self.after(0, self._compare_done)
+
+    def _append_token_box1(self, tok: str) -> None:
+        try:
+            self._box1.insert("end", tok)
+            self._box1.see("end")
+        except Exception:
+            pass
 
     def _append_token(self, tok: str) -> None:
         try:
@@ -746,6 +772,13 @@ class _CompareDialog(ctk.CTkToplevel):
 
     def _compare_done(self) -> None:
         # Clear placeholder "Running…" if it's still the first content.
+        try:
+            content = self._box1.get("1.0", "end").strip()
+            if content.startswith("Running…"):
+                self._box1.delete("1.0", "end")
+                self._box1.insert("end", content[len("Running…"):].lstrip())
+        except Exception:
+            pass
         try:
             content = self._box2.get("1.0", "end").strip()
             if content.startswith("Running…"):
@@ -937,9 +970,9 @@ class LLMInsightsView(ctk.CTkFrame):
         ).pack(side="left", padx=(0, PAD_S))
 
         ctk.CTkButton(
-            btn_frame, text="💾  Export",
+            btn_frame, text="💾  Export Markdown",
             fg_color=BG_SECONDARY, hover_color="#2a3a4a",
-            corner_radius=BTN_CORNER, width=90,
+            corner_radius=BTN_CORNER, width=140,
             command=self._export_markdown,
         ).pack(side="left", padx=(0, PAD_S))
 
@@ -1304,6 +1337,17 @@ class LLMInsightsView(ctk.CTkFrame):
                 col = "#2ecc71"
             badges.append((f"CVSS {score_str}", col))
 
+        # Service names (best-effort extraction from LLM prose)
+        common_services = {
+            "ssh", "ftp", "telnet", "rdp", "smb", "http", "https", "mysql",
+            "postgresql", "postgres", "mongodb", "redis", "smtp", "dns", "snmp",
+            "ldap", "kerberos", "vnc", "rpc", "mssql", "ms-sql", "imap", "pop3",
+        }
+        words = re.findall(r"\b[a-z][a-z0-9\-]{1,20}\b", raw.lower())
+        for w in words:
+            if w in common_services:
+                badges.append((f"SVC {w.upper()}", "#2a6a9a"))
+
         if not badges:
             return
 
@@ -1409,12 +1453,12 @@ class LLMInsightsView(ctk.CTkFrame):
         _CompareDialog(
             self,
             prompt=self._last_prompt,
-            primary_result=result_text,
             primary_name=self._cfg_provider,
+            primary_key=self._cfg_key,
+            primary_model=self._cfg_model,
             history=list(self._conversation_history),
             system_prompt=self._cfg_system_prompt,
             cmp_provider_name=self._cfg_cmp_provider,
             cmp_key=self._cfg_cmp_key,
         )
-
 
