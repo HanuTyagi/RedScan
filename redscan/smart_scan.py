@@ -82,8 +82,13 @@ class AdaptiveRateController:
             self._timeout_events.popleft()
 
     def control_update(self) -> None:
-        if self._rtt_filtered is None or self._rtt_base is None:
+        if self._rtt_filtered is None:
             return
+        if self._rtt_base is None:
+            # Fallback for short scans: if warm-up never completed but we have
+            # at least one RTT observation, start controlling using the current
+            # filtered RTT as a conservative baseline.
+            self._rtt_base = self._rtt_filtered
 
         now = time.monotonic()
         self._prune_timeout_events(now)
@@ -174,9 +179,17 @@ class SmartScanModule:
             # counter; that decision is made in discovery_pass() where the caller
             # knows whether this probe is a calibration probe.
             return ProbeResult(endpoint=endpoint, status="timeout")
-        except (ConnectionRefusedError, OSError):
+        except ConnectionRefusedError:
             rtt_ms = (time.perf_counter() - start) * 1000.0
             return ProbeResult(endpoint=endpoint, status="closed", rtt_ms=rtt_ms)
+        except OSError as exc:
+            # Connection-reset/refused style socket errors indicate a reachable
+            # host with a closed port; route/host errors should not be coerced
+            # into "closed".
+            if exc.errno in {111, 61, 104, 54, 10061, 10054}:
+                rtt_ms = (time.perf_counter() - start) * 1000.0
+                return ProbeResult(endpoint=endpoint, status="closed", rtt_ms=rtt_ms)
+            return ProbeResult(endpoint=endpoint, status="error", error=str(exc))
         except Exception as exc:  # pragma: no cover
             return ProbeResult(endpoint=endpoint, status="error", error=str(exc))
         finally:
