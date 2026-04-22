@@ -71,7 +71,7 @@ def parse_nmap_xml(xml_file):
                 service_product = service_elem.attrib.get('product', '') if service_elem is not None else ''
                 service_version = service_elem.attrib.get('version', '') if service_elem is not None else ''
                 service_extrainfo = service_elem.attrib.get('extrainfo', '') if service_elem is not None else ''
-                service_cpe = [c.text for c in service_elem.findall('cpe')] if service_elem is not None else []
+                service_cpe = [c.text for c in service_elem.findall('cpe') if c.text] if service_elem is not None else []
                 state_reason = state_elem.attrib.get('reason', '') if state_elem is not None else ''
 
                 # Scripts attached to this port

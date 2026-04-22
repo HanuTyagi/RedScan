@@ -117,6 +117,21 @@ def _is_root_runtime() -> bool:
             return False
 
 
+def _normalize_host_label(raw: str) -> str:
+    """Normalize nmap host label to a stable key.
+
+    Examples:
+      "scanme.nmap.org (45.33.32.156)" -> "45.33.32.156"
+      "45.33.32.156" -> "45.33.32.156"
+      "example.local" -> "example.local"
+    """
+    raw = raw.strip()
+    m = re.search(r"\(([^)]+)\)$", raw)
+    if m:
+        return m.group(1).strip()
+    return raw
+
+
 class DashboardView(ctk.CTkFrame):
     """Main scan dashboard with real-time output and host/port table."""
 
@@ -184,8 +199,9 @@ class DashboardView(ctk.CTkFrame):
         self._ports_status_lbl = ctk.CTkLabel(ctrl, text="", font=FONT_SMALL, text_color=TEXT_MUTED)
         self._ports_status_lbl.pack(side="left", padx=(0, PAD))
 
-        priv_text = "ROOT / ADMIN" if _is_root_runtime() else "STANDARD USER"
-        priv_color = TEXT_SUCCESS if _is_root_runtime() else "#f39c12"
+        is_root = _is_root_runtime()
+        priv_text = "ROOT / ADMIN" if is_root else "STANDARD USER"
+        priv_color = TEXT_SUCCESS if is_root else "#f39c12"
         ctk.CTkLabel(ctrl, text=f"Privileges: {priv_text}", font=FONT_SMALL, text_color=priv_color).pack(
             side="left", padx=(0, PAD)
         )
@@ -544,7 +560,7 @@ class DashboardView(ctk.CTkFrame):
                 # Parse host
                 m_host = _HOST_RE.search(line)
                 if m_host:
-                    current_host = m_host.group(1).strip()
+                    current_host = _normalize_host_label(m_host.group(1))
                     self._event_queue.put({"type": "new_host", "host": current_host})
                 # Parse open port
                 m_port = _OPEN_PORT_RE.search(line)
@@ -768,8 +784,7 @@ class DashboardView(ctk.CTkFrame):
             # Build a lookup by (port, protocol) from the XML.
             xml_ports: dict[tuple[str, str], dict[str, Any]] = {}
             for p in host_data.get("ports", []):
-                if p.get("state") == "open":
-                    xml_ports[(str(p["port"]), str(p.get("protocol", "tcp")))] = p
+                xml_ports[(str(p["port"]), str(p.get("protocol", "tcp")))] = p
 
             # Update existing port records with richer version data.
             for port_rec in record.ports:
@@ -787,7 +802,7 @@ class DashboardView(ctk.CTkFrame):
                     port_rec["scripts"] = list(xml_p.get("scripts", []))
                     port_rec["reason"] = xml_p.get("reason", "")
                     port_rec["extrainfo"] = xml_p.get("extrainfo", "")
-                    port_rec["cpe"] = list(xml_p.get("cpe", []))
+                    port_rec["cpe"] = [c for c in xml_p.get("cpe", []) if c]
 
             # Add any ports that were in the XML but missed by the text regex
             # (rare but possible for filtered/closed ports shown in XML).
@@ -807,7 +822,7 @@ class DashboardView(ctk.CTkFrame):
                         "scripts": list(xml_p.get("scripts", [])),
                         "reason": xml_p.get("reason", ""),
                         "extrainfo": xml_p.get("extrainfo", ""),
-                        "cpe": list(xml_p.get("cpe", [])),
+                        "cpe": [c for c in xml_p.get("cpe", []) if c],
                     })
 
         # Re-render the currently-selected host table with enriched data.
@@ -865,8 +880,15 @@ class DashboardView(ctk.CTkFrame):
                     self._port_table.insert("end", f"      cpe: {', '.join(str(c) for c in cpes[:2])}\n")
 
     def _update_stats(self) -> None:
-        total_ports = sum(len(h.ports) for h in self._hosts.values())
-        services = {p["service"] for h in self._hosts.values() for p in h.ports}
+        total_ports = sum(
+            1 for h in self._hosts.values() for p in h.ports if p.get("state", "open") == "open"
+        )
+        services = {
+            p["service"]
+            for h in self._hosts.values()
+            for p in h.ports
+            if p.get("state", "open") == "open"
+        }
         os_count = sum(1 for h in self._hosts.values() if h.os_guess != "Unknown")
         self._stat_hosts.configure(text=str(len(self._hosts)))
         self._stat_open.configure(text=str(total_ports))
