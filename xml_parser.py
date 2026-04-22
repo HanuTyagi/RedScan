@@ -26,7 +26,8 @@ def parse_nmap_xml(xml_file):
             "status": "Unknown",
             "hostnames": [],
             "ports": [],
-            "os_matches": []
+            "os_matches": [],
+            "latency_ms": None,
         }
 
         # Status
@@ -46,6 +47,15 @@ def parse_nmap_xml(xml_file):
         if hostnames_elem is not None:
             for hname in hostnames_elem.findall('hostname'):
                 host_data["hostnames"].append(hname.attrib.get('name'))
+
+        # Latency estimate (if present)
+        times_elem = host.find('times')
+        if times_elem is not None and times_elem.attrib.get('srtt'):
+            try:
+                # nmap reports srtt in microseconds.
+                host_data["latency_ms"] = round(int(times_elem.attrib.get('srtt', '0')) / 1000.0, 2)
+            except ValueError:
+                host_data["latency_ms"] = None
 
         # Ports
         ports_elem = host.find('ports')
@@ -111,6 +121,8 @@ def display_insights(scan_info):
         primary_ip = next((a['addr'] for a in host['addresses'] if a['type'] == 'ipv4'), host['addresses'][0]['addr'] if host['addresses'] else 'Unknown')
         print(f"  > IP Address  : {primary_ip}")
         print(f"  > Status      : {host['status'].upper()}")
+        if host.get("latency_ms") is not None:
+            print(f"  > Latency     : {host['latency_ms']} ms")
         
         if host['hostnames']:
             print(f"  > Hostnames   : {', '.join(host['hostnames'])}")

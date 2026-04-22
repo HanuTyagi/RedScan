@@ -74,6 +74,7 @@ class HostRecord:
         self.ports: list[dict[str, str]] = []
         self.os_guess: str = "Unknown"
         self.status: str = "up"
+        self.hostnames: list[str] = []
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +82,7 @@ class HostRecord:
             "ports": self.ports,
             "os_guess": self.os_guess,
             "status": self.status,
+            "hostnames": self.hostnames,
         }
 
     @staticmethod
@@ -89,7 +91,20 @@ class HostRecord:
         r.ports = d["ports"]
         r.os_guess = d.get("os_guess", "Unknown")
         r.status = d.get("status", "up")
+        r.hostnames = d.get("hostnames", [])
         return r
+
+
+def _is_root_runtime() -> bool:
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        # Windows: best-effort fallback
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0  # type: ignore[attr-defined]
+        except Exception:
+            return False
 
 
 class DashboardView(ctk.CTkFrame):
@@ -133,7 +148,7 @@ class DashboardView(ctk.CTkFrame):
         ctrl.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(PAD, 0))
 
         ctk.CTkLabel(ctrl, text="Target:", font=FONT_SMALL).pack(side="left", padx=(PAD, PAD_S))
-        self._target_var = tk.StringVar(value="127.0.0.1")
+        self._target_var = tk.StringVar(value="")
         ctk.CTkEntry(ctrl, textvariable=self._target_var, width=180, font=FONT_SMALL).pack(
             side="left", padx=(0, PAD)
         )
@@ -157,6 +172,12 @@ class DashboardView(ctk.CTkFrame):
         self._ports_entry.pack(side="left", padx=(PAD_S, PAD))
         self._ports_status_lbl = ctk.CTkLabel(ctrl, text="", font=FONT_SMALL, text_color=TEXT_MUTED)
         self._ports_status_lbl.pack(side="left", padx=(0, PAD))
+
+        priv_text = "ROOT / ADMIN" if _is_root_runtime() else "STANDARD USER"
+        priv_color = TEXT_SUCCESS if _is_root_runtime() else "#f39c12"
+        ctk.CTkLabel(ctrl, text=f"Privileges: {priv_text}", font=FONT_SMALL, text_color=priv_color).pack(
+            side="left", padx=(0, PAD)
+        )
 
         self._run_btn = ctk.CTkButton(
             ctrl, text="▶  Run Scan",
@@ -453,6 +474,10 @@ class DashboardView(ctk.CTkFrame):
     def _start_scan(self) -> None:
         if self._running:
             return
+        if not self._target_var.get().strip():
+            self._status_var.set("Enter a target IP/hostname before running.")
+            _error_dialog(self, "Missing Target", "Please enter a target IP, hostname, or CIDR range.")
+            return
         self._hosts.clear()
         self._host_listbox.delete(0, "end")
         self._port_table.delete("1.0", "end")
@@ -566,8 +591,10 @@ class DashboardView(ctk.CTkFrame):
             self._hosts[host].ports.append({
                 "port": event["port"],
                 "proto": event["proto"],
+                "state": "open",
                 "service": event["service"],
                 "version": event["version"],
+                "scripts": [],
             })
             self._update_stats()
             if self._current_host == host:
@@ -708,6 +735,7 @@ class DashboardView(ctk.CTkFrame):
             if os_matches:
                 best = os_matches[0]
                 record.os_guess = f"{best['name']} ({best.get('accuracy', '?')}%)"
+            record.hostnames = [str(h) for h in host_data.get("hostnames", []) if h]
 
             # ── Port enrichment ───────────────────────────────────────────────
             # Build a lookup by (port, protocol) from the XML.
@@ -728,6 +756,8 @@ class DashboardView(ctk.CTkFrame):
                         port_rec["version"] = full_version
                     if xml_p.get("service") and xml_p["service"] != "Unknown":
                         port_rec["service"] = xml_p["service"]
+                    port_rec["state"] = xml_p.get("state", port_rec.get("state", "open"))
+                    port_rec["scripts"] = list(xml_p.get("scripts", []))
 
             # Add any ports that were in the XML but missed by the text regex
             # (rare but possible for filtered/closed ports shown in XML).
@@ -741,8 +771,10 @@ class DashboardView(ctk.CTkFrame):
                     record.ports.append({
                         "port": port_num,
                         "proto": proto,
+                        "state": xml_p.get("state", "open"),
                         "service": xml_p.get("service", "unknown"),
                         "version": f"{product} {version}".strip(),
+                        "scripts": list(xml_p.get("scripts", [])),
                     })
 
         # Re-render the currently-selected host table with enriched data.
@@ -764,15 +796,21 @@ class DashboardView(ctk.CTkFrame):
         if host not in self._hosts:
             return
         record = self._hosts[host]
-        self._port_table.insert("end", f"HOST: {record.host}   OS: {record.os_guess}\n")
+        hostnames = f" ({', '.join(record.hostnames)})" if record.hostnames else ""
+        self._port_table.insert("end", f"HOST: {record.host}{hostnames}   OS: {record.os_guess}\n")
         self._port_table.insert("end", "─" * 70 + "\n")
-        self._port_table.insert("end", f"{'PORT':<10}{'PROTO':<8}{'SERVICE':<18}{'VERSION'}\n")
+        self._port_table.insert("end", f"{'PORT':<8}{'PROTO':<8}{'STATE':<10}{'SERVICE':<16}{'VERSION'}\n")
         self._port_table.insert("end", "─" * 70 + "\n")
         for p in record.ports:
             self._port_table.insert(
                 "end",
-                f"{p['port']:<10}{p['proto']:<8}{p['service']:<18}{p['version']}\n",
+                f"{p['port']:<8}{p['proto']:<8}{p.get('state', 'open'):<10}{p['service']:<16}{p['version']}\n",
             )
+            scripts = p.get("scripts", [])
+            if isinstance(scripts, list) and scripts:
+                ids = ", ".join(str(s.get("id", "")) for s in scripts[:3] if isinstance(s, dict) and s.get("id"))
+                if ids:
+                    self._port_table.insert("end", f"   ↳ NSE: {ids}\n")
 
     def _update_stats(self) -> None:
         total_ports = sum(len(h.ports) for h in self._hosts.values())
