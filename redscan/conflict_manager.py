@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -74,6 +75,8 @@ class ConflictRule:
     severity: Severity
     message: Callable[[_CMD, str, str, bool], str]
     fix: Callable[[_CMD], _CMD] | None = field(default=None)
+    category: str = "general"
+    remediation: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +153,32 @@ def _has_script(cmd: _CMD, *fragments: str) -> bool:
     return False
 
 
+def _normalize_command(cmd: _CMD) -> _CMD:
+    """Conservative command normalization before rule evaluation.
+
+    - Strips empty tokens.
+    - De-duplicates repeated standalone flags (keeps first occurrence).
+    """
+    cleaned = [t.strip() for t in cmd if str(t).strip()]
+    seen: set[str] = set()
+    # Flags that usually appear without a value and are safe to de-duplicate.
+    dedup_flags = {
+        "-n", "-R", "-Pn", "-sn", "-sS", "-sT", "-sU", "-sA", "-sW", "-sM",
+        "-sX", "-sF", "-sN", "-sI", "-sO", "-sV", "-sC", "-A", "-O", "-F",
+        "-p-", "-v", "-vv", "-d", "--open", "--reason", "--packet-trace",
+        "--traceroute", "--osscan-guess", "--defeat-rst-ratelimit",
+        "--randomize-hosts", "--badsum",
+    }
+    out: _CMD = []
+    for tok in cleaned:
+        if tok in dedup_flags:
+            if tok in seen:
+                continue
+            seen.add(tok)
+        out.append(tok)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Rule declarations
 # ---------------------------------------------------------------------------
@@ -175,6 +204,8 @@ DEFAULT_RULES: list[ConflictRule] = [
         # No mutation needed on cmd; the dashboard already skips -p when -sn
         # is present.  The rule is still logged so the user knows what happened.
         fix=lambda cmd: cmd,
+        category="ports",
+        remediation="Remove the external port range or switch to a port-scanning mode.",
     ),
 
     ConflictRule(
@@ -192,6 +223,8 @@ DEFAULT_RULES: list[ConflictRule] = [
             "-p-",
             "-F",
         ),
+        category="ports",
+        remediation="Do not combine -sn with port-selection flags.",
     ),
 
     ConflictRule(
@@ -323,6 +356,24 @@ DEFAULT_RULES: list[ConflictRule] = [
             + " require root / Administrator privileges.  This scan is blocked. "
             "Run RedScan with elevated privileges or choose a non-raw scan profile."
         ),
+        category="privilege",
+        remediation="Run as root/Administrator, or select a connect-scan preset (-sT).",
+    ),
+
+    ConflictRule(
+        name="wide_cidr_allports_aggressive",
+        check=lambda cmd, target, ports, root: (
+            "/" in target
+            and _has_flag(cmd, "-p-", "-T5")
+            and any(int(pfx) <= 20 for pfx in re.findall(r"/(\d{1,2})", target))
+        ),
+        severity="warning",
+        message=lambda cmd, target, ports, root: (
+            "[!] PERFORMANCE WARNING: Large CIDR target with aggressive full-port scan "
+            "(-p- and/or -T5) may generate excessive traffic and long runtimes."
+        ),
+        category="performance",
+        remediation="Reduce scope (smaller CIDR), use top ports, or lower timing template.",
     ),
 
     ConflictRule(
@@ -551,9 +602,12 @@ class ConflictManager:
         self,
         rules: list[ConflictRule] | None = None,
         disabled_rules: set[str] | None = None,
+        strict: bool = False,
     ) -> None:
         self._rules = rules if rules is not None else DEFAULT_RULES
         self._disabled: set[str] = set(disabled_rules) if disabled_rules else set()
+        self._strict = strict
+        self._rule_hits: Counter[str] = Counter()
 
     def apply(
         self,
@@ -593,19 +647,27 @@ class ConflictManager:
             except AttributeError:
                 is_root = True  # Windows — assume privileged
 
-        clean_cmd: list[str] = list(cmd)
+        clean_cmd: list[str] = _normalize_command(list(cmd))
         messages: list[_INFO] = []
 
         for rule in self._rules:
             if rule.name in self._disabled:
                 continue
             if rule.check(clean_cmd, target, ports_str, is_root):
+                self._rule_hits[rule.name] += 1
                 msg = rule.message(clean_cmd, target, ports_str, is_root)
-                messages.append((rule.severity, msg))
+                sev: Severity = rule.severity
+                if self._strict and sev == "warning":
+                    sev = "error"
+                messages.append((sev, msg))
                 if rule.severity == "auto_fix" and rule.fix is not None:
                     clean_cmd = list(rule.fix(clean_cmd))
 
         return clean_cmd, messages
+
+    def rule_hit_counts(self) -> dict[str, int]:
+        """Return in-memory telemetry for triggered rules in this manager instance."""
+        return dict(self._rule_hits)
 
     @staticmethod
     def has_errors(messages: list[_INFO]) -> bool:
