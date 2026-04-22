@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -75,6 +76,9 @@ class HostRecord:
         self.os_guess: str = "Unknown"
         self.status: str = "up"
         self.hostnames: list[str] = []
+        self.first_seen: str = datetime.now().isoformat(timespec="seconds")
+        self.last_seen: str = self.first_seen
+        self.scan_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -83,6 +87,9 @@ class HostRecord:
             "os_guess": self.os_guess,
             "status": self.status,
             "hostnames": self.hostnames,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "scan_id": self.scan_id,
         }
 
     @staticmethod
@@ -92,6 +99,9 @@ class HostRecord:
         r.os_guess = d.get("os_guess", "Unknown")
         r.status = d.get("status", "up")
         r.hostnames = d.get("hostnames", [])
+        r.first_seen = d.get("first_seen", datetime.now().isoformat(timespec="seconds"))
+        r.last_seen = d.get("last_seen", r.first_seen)
+        r.scan_id = d.get("scan_id", "")
         return r
 
 
@@ -123,6 +133,7 @@ class DashboardView(ctk.CTkFrame):
         self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._running = False
         self._command_used = ""
+        self._scan_id = ""
         # Temporary XML output file for post-scan enrichment (set per scan).
         self._xml_tempfile: str | None = None
         # User-defined presets loaded from ~/.redscan_presets.json.
@@ -268,6 +279,14 @@ class DashboardView(ctk.CTkFrame):
             detail_hdr, text="Select a host →", font=FONT_H2, anchor="w"
         )
         self._detail_host_lbl.pack(side="left")
+        self._show_advanced_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            detail_hdr,
+            text="Advanced",
+            variable=self._show_advanced_var,
+            command=lambda: self._refresh_port_table(self._current_host) if self._current_host else None,
+            width=90,
+        ).pack(side="right", padx=(0, PAD_S))
 
         self._ai_btn = ctk.CTkButton(
             detail_hdr,
@@ -482,6 +501,7 @@ class DashboardView(ctk.CTkFrame):
         self._host_listbox.delete(0, "end")
         self._port_table.delete("1.0", "end")
         self._log_text.delete("1.0", "end")
+        self._scan_id = str(uuid.uuid4())
         self._running = True
         self._run_btn.configure(state="disabled")
 
@@ -580,13 +600,16 @@ class DashboardView(ctk.CTkFrame):
             host = event["host"]
             if host not in self._hosts:
                 self._hosts[host] = HostRecord(host)
+                self._hosts[host].scan_id = self._scan_id
                 self._host_listbox.insert("end", f"  {host}")
                 self._update_stats()
+            self._hosts[host].last_seen = datetime.now().isoformat(timespec="seconds")
 
         elif etype == "open_port":
             host = event["host"]
             if host not in self._hosts:
                 self._hosts[host] = HostRecord(host)
+                self._hosts[host].scan_id = self._scan_id
                 self._host_listbox.insert("end", f"  {host}")
             self._hosts[host].ports.append({
                 "port": event["port"],
@@ -595,7 +618,11 @@ class DashboardView(ctk.CTkFrame):
                 "service": event["service"],
                 "version": event["version"],
                 "scripts": [],
+                "reason": "",
+                "extrainfo": "",
+                "cpe": [],
             })
+            self._hosts[host].last_seen = datetime.now().isoformat(timespec="seconds")
             self._update_stats()
             if self._current_host == host:
                 self._refresh_port_table(host)
@@ -758,6 +785,9 @@ class DashboardView(ctk.CTkFrame):
                         port_rec["service"] = xml_p["service"]
                     port_rec["state"] = xml_p.get("state", port_rec.get("state", "open"))
                     port_rec["scripts"] = list(xml_p.get("scripts", []))
+                    port_rec["reason"] = xml_p.get("reason", "")
+                    port_rec["extrainfo"] = xml_p.get("extrainfo", "")
+                    port_rec["cpe"] = list(xml_p.get("cpe", []))
 
             # Add any ports that were in the XML but missed by the text regex
             # (rare but possible for filtered/closed ports shown in XML).
@@ -775,6 +805,9 @@ class DashboardView(ctk.CTkFrame):
                         "service": xml_p.get("service", "unknown"),
                         "version": f"{product} {version}".strip(),
                         "scripts": list(xml_p.get("scripts", [])),
+                        "reason": xml_p.get("reason", ""),
+                        "extrainfo": xml_p.get("extrainfo", ""),
+                        "cpe": list(xml_p.get("cpe", [])),
                     })
 
         # Re-render the currently-selected host table with enriched data.
@@ -798,9 +831,14 @@ class DashboardView(ctk.CTkFrame):
         record = self._hosts[host]
         hostnames = f" ({', '.join(record.hostnames)})" if record.hostnames else ""
         self._port_table.insert("end", f"HOST: {record.host}{hostnames}   OS: {record.os_guess}\n")
+        self._port_table.insert(
+            "end",
+            f"SCAN ID: {record.scan_id or 'n/a'}   First Seen: {record.first_seen}   Last Seen: {record.last_seen}\n",
+        )
         self._port_table.insert("end", "─" * 70 + "\n")
         self._port_table.insert("end", f"{'PORT':<8}{'PROTO':<8}{'STATE':<10}{'SERVICE':<16}{'VERSION'}\n")
         self._port_table.insert("end", "─" * 70 + "\n")
+        advanced = self._show_advanced_var.get()
         for p in record.ports:
             self._port_table.insert(
                 "end",
@@ -811,6 +849,20 @@ class DashboardView(ctk.CTkFrame):
                 ids = ", ".join(str(s.get("id", "")) for s in scripts[:3] if isinstance(s, dict) and s.get("id"))
                 if ids:
                     self._port_table.insert("end", f"   ↳ NSE: {ids}\n")
+                if advanced:
+                    for s in scripts[:2]:
+                        if isinstance(s, dict):
+                            out = str(s.get("output", "")).splitlines()[0][:120]
+                            if out:
+                                self._port_table.insert("end", f"      • {s.get('id', 'script')}: {out}\n")
+            if advanced:
+                if p.get("reason"):
+                    self._port_table.insert("end", f"      reason: {p.get('reason')}\n")
+                if p.get("extrainfo"):
+                    self._port_table.insert("end", f"      extra: {p.get('extrainfo')}\n")
+                cpes = p.get("cpe", [])
+                if isinstance(cpes, list) and cpes:
+                    self._port_table.insert("end", f"      cpe: {', '.join(str(c) for c in cpes[:2])}\n")
 
     def _update_stats(self) -> None:
         total_ports = sum(len(h.ports) for h in self._hosts.values())

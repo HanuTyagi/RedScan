@@ -70,6 +70,9 @@ def parse_nmap_xml(xml_file):
                 service_name = service_elem.attrib.get('name') if service_elem is not None else 'Unknown'
                 service_product = service_elem.attrib.get('product', '') if service_elem is not None else ''
                 service_version = service_elem.attrib.get('version', '') if service_elem is not None else ''
+                service_extrainfo = service_elem.attrib.get('extrainfo', '') if service_elem is not None else ''
+                service_cpe = [c.text for c in service_elem.findall('cpe')] if service_elem is not None else []
+                state_reason = state_elem.attrib.get('reason', '') if state_elem is not None else ''
 
                 # Scripts attached to this port
                 scripts = []
@@ -86,7 +89,10 @@ def parse_nmap_xml(xml_file):
                     "service": service_name,
                     "product": service_product,
                     "version": service_version,
-                    "scripts": scripts
+                    "scripts": scripts,
+                    "reason": state_reason,
+                    "extrainfo": service_extrainfo,
+                    "cpe": service_cpe,
                 })
         
         # OS Detection
@@ -143,6 +149,12 @@ def display_insights(scan_info):
             for p in open_ports:
                 version_str = f"{p['product']} {p['version']}".strip()
                 print(f"    {p['port']:<8} {p['state']:<6} {p['service']:<12} {version_str}")
+                if p.get("reason"):
+                    print(f"      [i] Reason: {p['reason']}")
+                if p.get("extrainfo"):
+                    print(f"      [i] Extra : {p['extrainfo']}")
+                if p.get("cpe"):
+                    print(f"      [i] CPE   : {', '.join(p['cpe'][:2])}")
                 
                 # Check for critical ports
                 critical_ports = {
