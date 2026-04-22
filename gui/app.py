@@ -185,10 +185,12 @@ class RedScanApp(ctk.CTk):
     # ── Cross-view callbacks ──────────────────────────────────────────────────
 
     def _on_preset_run(self, preset: ScanPreset) -> None:
-        """Preset Library: run a preset on the Dashboard."""
+        """Preset Library: load preset on Dashboard without auto-running.
+
+        Users may want to adjust target/ports first, then click Run manually.
+        """
         self._show_view("dashboard")
         self._dashboard.set_preset(preset.key)
-        self._dashboard.start_scan()
 
     def _on_preset_to_factory(self, preset: ScanPreset) -> None:
         """Preset Library: load a preset into the Command Factory canvas."""

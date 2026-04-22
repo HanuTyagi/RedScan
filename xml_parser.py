@@ -26,7 +26,8 @@ def parse_nmap_xml(xml_file):
             "status": "Unknown",
             "hostnames": [],
             "ports": [],
-            "os_matches": []
+            "os_matches": [],
+            "latency_ms": None,
         }
 
         # Status
@@ -47,6 +48,15 @@ def parse_nmap_xml(xml_file):
             for hname in hostnames_elem.findall('hostname'):
                 host_data["hostnames"].append(hname.attrib.get('name'))
 
+        # Latency estimate (if present)
+        times_elem = host.find('times')
+        if times_elem is not None and times_elem.attrib.get('srtt'):
+            try:
+                # nmap reports srtt in microseconds.
+                host_data["latency_ms"] = round(int(times_elem.attrib.get('srtt', '0')) / 1000.0, 2)
+            except ValueError:
+                host_data["latency_ms"] = None
+
         # Ports
         ports_elem = host.find('ports')
         if ports_elem is not None:
@@ -60,6 +70,9 @@ def parse_nmap_xml(xml_file):
                 service_name = service_elem.attrib.get('name') if service_elem is not None else 'Unknown'
                 service_product = service_elem.attrib.get('product', '') if service_elem is not None else ''
                 service_version = service_elem.attrib.get('version', '') if service_elem is not None else ''
+                service_extrainfo = service_elem.attrib.get('extrainfo', '') if service_elem is not None else ''
+                service_cpe = [c.text for c in service_elem.findall('cpe') if c.text] if service_elem is not None else []
+                state_reason = state_elem.attrib.get('reason', '') if state_elem is not None else ''
 
                 # Scripts attached to this port
                 scripts = []
@@ -76,7 +89,10 @@ def parse_nmap_xml(xml_file):
                     "service": service_name,
                     "product": service_product,
                     "version": service_version,
-                    "scripts": scripts
+                    "scripts": scripts,
+                    "reason": state_reason,
+                    "extrainfo": service_extrainfo,
+                    "cpe": service_cpe,
                 })
         
         # OS Detection
@@ -111,6 +127,8 @@ def display_insights(scan_info):
         primary_ip = next((a['addr'] for a in host['addresses'] if a['type'] == 'ipv4'), host['addresses'][0]['addr'] if host['addresses'] else 'Unknown')
         print(f"  > IP Address  : {primary_ip}")
         print(f"  > Status      : {host['status'].upper()}")
+        if host.get("latency_ms") is not None:
+            print(f"  > Latency     : {host['latency_ms']} ms")
         
         if host['hostnames']:
             print(f"  > Hostnames   : {', '.join(host['hostnames'])}")
@@ -131,6 +149,12 @@ def display_insights(scan_info):
             for p in open_ports:
                 version_str = f"{p['product']} {p['version']}".strip()
                 print(f"    {p['port']:<8} {p['state']:<6} {p['service']:<12} {version_str}")
+                if p.get("reason"):
+                    print(f"      [i] Reason: {p['reason']}")
+                if p.get("extrainfo"):
+                    print(f"      [i] Extra : {p['extrainfo']}")
+                if p.get("cpe"):
+                    print(f"      [i] CPE   : {', '.join(p['cpe'][:2])}")
                 
                 # Check for critical ports
                 critical_ports = {

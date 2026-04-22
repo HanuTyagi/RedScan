@@ -313,6 +313,18 @@ class CommandFactoryView(ctk.CTkFrame):
 
         self._build()
 
+    @staticmethod
+    def _safe_grab(window: ctk.CTkToplevel) -> None:
+        """Best-effort modal grab that avoids 'window not viewable' TclError."""
+        def _apply() -> None:
+            try:
+                if window.winfo_exists() and window.winfo_viewable():
+                    window.grab_set()
+            except tk.TclError:
+                # Non-fatal; leave dialog modeless instead of crashing callback.
+                pass
+        window.after(1, _apply)
+
     # ── Build ────────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
@@ -969,7 +981,7 @@ class CommandFactoryView(ctk.CTkFrame):
         dlg = ctk.CTkToplevel(self)
         dlg.title("Save as Preset")
         dlg.geometry("400x180")
-        dlg.grab_set()
+        self._safe_grab(dlg)
 
         ctk.CTkLabel(dlg, text="Preset Name:", font=FONT_SMALL).pack(padx=PAD, pady=(PAD, 0), anchor="w")
         name_entry = ctk.CTkEntry(dlg, font=FONT_BODY, placeholder_text="My Custom Scan")
@@ -1011,7 +1023,7 @@ class CommandFactoryView(ctk.CTkFrame):
         popup = ctk.CTkToplevel(self)
         popup.title("Command History")
         popup.geometry("740x320")
-        popup.grab_set()
+        self._safe_grab(popup)
 
         if not self._history:
             ctk.CTkLabel(
@@ -1064,7 +1076,7 @@ class CommandFactoryView(ctk.CTkFrame):
         popup = ctk.CTkToplevel(self)
         popup.title("Start from Template")
         popup.geometry("480x440")
-        popup.grab_set()
+        self._safe_grab(popup)
 
         ctk.CTkLabel(
             popup,
@@ -1131,7 +1143,7 @@ class CommandFactoryView(ctk.CTkFrame):
             dlg = ctk.CTkToplevel(self)
             dlg.title("Explain Command")
             dlg.geometry("440x160")
-            dlg.grab_set()
+            self._safe_grab(dlg)
             ctk.CTkLabel(
                 dlg,
                 text=(
@@ -1229,7 +1241,7 @@ class CommandFactoryView(ctk.CTkFrame):
         popup = ctk.CTkToplevel(self)
         popup.title("Conflict Rule Editor")
         popup.geometry("700x500")
-        popup.grab_set()
+        self._safe_grab(popup)
 
         ctk.CTkLabel(
             popup,
@@ -1322,7 +1334,7 @@ class CommandFactoryView(ctk.CTkFrame):
         popup = ctk.CTkToplevel(self)
         popup.title("Validate Command")
         popup.geometry("640x380")
-        popup.grab_set()
+        self._safe_grab(popup)
 
         status_var = tk.StringVar(value="⏳  Running validation…")
         ctk.CTkLabel(
@@ -1436,7 +1448,7 @@ class CommandFactoryView(ctk.CTkFrame):
         popup = ctk.CTkToplevel(self)
         popup.title("Piece Macros")
         popup.geometry("600x460")
-        popup.grab_set()
+        self._safe_grab(popup)
 
         # ── Save current canvas as macro ──────────────────────────────────────
         save_frame = ctk.CTkFrame(popup, fg_color="#1a2a3a", corner_radius=8)
@@ -1576,4 +1588,3 @@ class CommandFactoryView(ctk.CTkFrame):
             self._refresh_palette()
             self._update_preview()
             self.after(2000, self._clear_diff)
-

@@ -669,38 +669,35 @@ class SmartScanView(ctk.CTkFrame):
             self.after(0, self._update_live_feed, result, is_calib)
 
         async def _run() -> None:
-            batch_size = 20
-            open_count = 0
-            total = 0
-            total_dropped = 0
-            for i in range(0, len(endpoints), batch_size):
-                if not self._running:
-                    break
-                batch = endpoints[i : i + batch_size]
-                output = await module.discovery_pass(batch, per_probe_callback=_on_probe,
-                                                     resume=(resume and i == 0))
-                total += output.stats.total_count
-                total_dropped += output.stats.timeout_count
-                for ep in output.open_endpoints:
-                    open_count += 1
-                    all_open.append({"host": ep.host, "port": ep.port})
-                    rtt_result = next(
-                        (r for r in output.all_results if r.endpoint == ep and r.rtt_ms), None
-                    )
-                    rtt_str = (
-                        f"{rtt_result.rtt_ms:.1f}ms"
-                        if rtt_result and rtt_result.rtt_ms else "—"
-                    )
-                    self.after(0, self._log_msg, f"[+] OPEN  {ep.host}:{ep.port}  rtt={rtt_str}\n")
-                final_rate_box[0] = output.stats.final_rate
-                final_stats_box[0] = output.stats
-                self.after(
-                    0, self._update_live,
-                    output.stats.final_rate,
-                    output.stats.calibration_rtt_filtered_ms,
-                    open_count, total, total_dropped,
+            if not self._running:
+                return
+            output = await module.discovery_pass(
+                endpoints,
+                per_probe_callback=_on_probe,
+                resume=resume,
+            )
+            total = output.stats.total_count
+            total_dropped = output.stats.timeout_count
+            open_count = len(output.open_endpoints)
+            for ep in output.open_endpoints:
+                all_open.append({"host": ep.host, "port": ep.port})
+                rtt_result = next(
+                    (r for r in output.all_results if r.endpoint == ep and r.rtt_ms), None
                 )
-                self.after(0, self._card_open.configure, {"text": str(open_count)})
+                rtt_str = (
+                    f"{rtt_result.rtt_ms:.1f}ms"
+                    if rtt_result and rtt_result.rtt_ms else "—"
+                )
+                self.after(0, self._log_msg, f"[+] OPEN  {ep.host}:{ep.port}  rtt={rtt_str}\n")
+            final_rate_box[0] = output.stats.final_rate
+            final_stats_box[0] = output.stats
+            self.after(
+                0, self._update_live,
+                output.stats.final_rate,
+                output.stats.calibration_rtt_filtered_ms,
+                open_count, total, total_dropped,
+            )
+            self.after(0, self._card_open.configure, {"text": str(open_count)})
 
         try:
             loop.run_until_complete(_run())

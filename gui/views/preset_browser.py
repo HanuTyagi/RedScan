@@ -522,7 +522,7 @@ class PresetBrowserView(ctk.CTkFrame):
 
         # Show back button
         self._back_btn.pack(side="left", padx=(PAD_S, 0))
-        self._title_lbl.configure(text=f"🔍  Search: "{query}"")
+        self._title_lbl.configure(text=f'🔍  Search: "{query}"')
 
         # Deduplicate by key while preserving order; include imported presets
         seen: set[str] = set()
@@ -608,7 +608,7 @@ class PresetBrowserView(ctk.CTkFrame):
         messagebox.showinfo(
             "Import Complete",
             f"Successfully imported {len(presets)} preset(s) into the "
-            f""{_VIRTUAL_IMPORTED}" category.",
+            f'"{_VIRTUAL_IMPORTED}" category.',
         )
         # Refresh landing so the Imported tile appears / updates
         if self._current_category is None:
@@ -654,4 +654,3 @@ class PresetBrowserView(ctk.CTkFrame):
     def _clear_scroll(self) -> None:
         for child in self._scroll.winfo_children():
             child.destroy()
-

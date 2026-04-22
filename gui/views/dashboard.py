@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -74,6 +75,10 @@ class HostRecord:
         self.ports: list[dict[str, str]] = []
         self.os_guess: str = "Unknown"
         self.status: str = "up"
+        self.hostnames: list[str] = []
+        self.first_seen: str = datetime.now().isoformat(timespec="seconds")
+        self.last_seen: str = self.first_seen
+        self.scan_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +86,10 @@ class HostRecord:
             "ports": self.ports,
             "os_guess": self.os_guess,
             "status": self.status,
+            "hostnames": self.hostnames,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "scan_id": self.scan_id,
         }
 
     @staticmethod
@@ -89,7 +98,38 @@ class HostRecord:
         r.ports = d["ports"]
         r.os_guess = d.get("os_guess", "Unknown")
         r.status = d.get("status", "up")
+        r.hostnames = d.get("hostnames", [])
+        r.first_seen = d.get("first_seen", datetime.now().isoformat(timespec="seconds"))
+        r.last_seen = d.get("last_seen", r.first_seen)
+        r.scan_id = d.get("scan_id", "")
         return r
+
+
+def _is_root_runtime() -> bool:
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        # Windows: best-effort fallback
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0  # type: ignore[attr-defined]
+        except Exception:
+            return False
+
+
+def _normalize_host_label(raw: str) -> str:
+    """Normalize nmap host label to a stable key.
+
+    Examples:
+      "scanme.nmap.org (45.33.32.156)" -> "45.33.32.156"
+      "45.33.32.156" -> "45.33.32.156"
+      "example.local" -> "example.local"
+    """
+    raw = raw.strip()
+    m = re.search(r"\(([^)]+)\)$", raw)
+    if m:
+        return m.group(1).strip()
+    return raw
 
 
 class DashboardView(ctk.CTkFrame):
@@ -108,6 +148,7 @@ class DashboardView(ctk.CTkFrame):
         self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._running = False
         self._command_used = ""
+        self._scan_id = ""
         # Temporary XML output file for post-scan enrichment (set per scan).
         self._xml_tempfile: str | None = None
         # User-defined presets loaded from ~/.redscan_presets.json.
@@ -118,6 +159,7 @@ class DashboardView(ctk.CTkFrame):
         self._poll_events()
         # Defer user preset loading until the event loop is running.
         self.after(200, self._load_user_presets)
+        self.after(250, self._refresh_ports_gate)
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -132,13 +174,14 @@ class DashboardView(ctk.CTkFrame):
         ctrl.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(PAD, 0))
 
         ctk.CTkLabel(ctrl, text="Target:", font=FONT_SMALL).pack(side="left", padx=(PAD, PAD_S))
-        self._target_var = tk.StringVar(value="127.0.0.1")
+        self._target_var = tk.StringVar(value="")
         ctk.CTkEntry(ctrl, textvariable=self._target_var, width=180, font=FONT_SMALL).pack(
             side="left", padx=(0, PAD)
         )
 
         preset_keys = ["(none)"] + [p.key for p in PRESET_CATALOGUE]
         self._preset_var = tk.StringVar(value="(none)")
+        self._preset_var.trace_add("write", lambda *_: self._refresh_ports_gate())
         ctk.CTkLabel(ctrl, text="Preset:", font=FONT_SMALL).pack(side="left")
         self._preset_combo = ctk.CTkComboBox(
             ctrl,
@@ -151,8 +194,16 @@ class DashboardView(ctk.CTkFrame):
 
         ctk.CTkLabel(ctrl, text="Ports:", font=FONT_SMALL).pack(side="left")
         self._ports_var = tk.StringVar(value="1-1024")
-        ctk.CTkEntry(ctrl, textvariable=self._ports_var, width=120, font=FONT_SMALL).pack(
-            side="left", padx=(PAD_S, PAD)
+        self._ports_entry = ctk.CTkEntry(ctrl, textvariable=self._ports_var, width=120, font=FONT_SMALL)
+        self._ports_entry.pack(side="left", padx=(PAD_S, PAD))
+        self._ports_status_lbl = ctk.CTkLabel(ctrl, text="", font=FONT_SMALL, text_color=TEXT_MUTED)
+        self._ports_status_lbl.pack(side="left", padx=(0, PAD))
+
+        is_root = _is_root_runtime()
+        priv_text = "ROOT / ADMIN" if is_root else "STANDARD USER"
+        priv_color = TEXT_SUCCESS if is_root else "#f39c12"
+        ctk.CTkLabel(ctrl, text=f"Privileges: {priv_text}", font=FONT_SMALL, text_color=priv_color).pack(
+            side="left", padx=(0, PAD)
         )
 
         self._run_btn = ctk.CTkButton(
@@ -244,6 +295,14 @@ class DashboardView(ctk.CTkFrame):
             detail_hdr, text="Select a host →", font=FONT_H2, anchor="w"
         )
         self._detail_host_lbl.pack(side="left")
+        self._show_advanced_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            detail_hdr,
+            text="Advanced",
+            variable=self._show_advanced_var,
+            command=lambda: self._refresh_port_table(self._current_host) if self._current_host else None,
+            width=90,
+        ).pack(side="right", padx=(0, PAD_S))
 
         self._ai_btn = ctk.CTkButton(
             detail_hdr,
@@ -361,7 +420,7 @@ class DashboardView(ctk.CTkFrame):
         # Conflict rule: -sn (host-discovery-only) has no port-scan phase.
         # Silently drop the port specification; _log_preflight_warnings() will
         # tell the user what happened.
-        if ports_str and "-sn" not in cmd:
+        if ports_str and ConflictManager.needs_ports_input(cmd):
             cmd.extend(["-p", ports_str])
 
         # Write XML to a temp file in addition to the default text output.
@@ -378,6 +437,36 @@ class DashboardView(ctk.CTkFrame):
         # and those regexes would never match, leaving the dashboard empty.
         cmd.append(target)
         return cmd
+
+    def _refresh_ports_gate(self) -> None:
+        """Disable Ports input when active scan flags already define port scope."""
+        preset_key = self._preset_var.get()
+        preset = get_by_key(preset_key) if preset_key != "(none)" else None
+        cmd: list[str] = ["nmap"]
+        if preset:
+            cmd.extend(preset.flags)
+        else:
+            cmd.extend(["-sT", "-sV", "-T4"])
+
+        if ConflictManager.needs_ports_input(cmd):
+            self._ports_entry.configure(state="normal", text_color=TEXT_PRIMARY)
+            self._ports_status_lbl.configure(text="")
+            return
+
+        flags = set(cmd)
+        if "-sn" in flags:
+            reason = "disabled — ping-only scan"
+        elif "-p-" in flags:
+            reason = "disabled — all 65535 ports"
+        elif "-F" in flags:
+            reason = "disabled — top-100 ports"
+        elif "--top-ports" in flags:
+            reason = "disabled — --top-ports set"
+        else:
+            reason = "disabled"
+
+        self._ports_entry.configure(state="disabled", text_color="#777")
+        self._ports_status_lbl.configure(text=f"({reason})")
 
     @staticmethod
     def _new_xml_tempfile() -> str | None:
@@ -420,10 +509,15 @@ class DashboardView(ctk.CTkFrame):
     def _start_scan(self) -> None:
         if self._running:
             return
+        if not self._target_var.get().strip():
+            self._status_var.set("Enter a target IP/hostname before running.")
+            _error_dialog(self, "Missing Target", "Please enter a target IP, hostname, or CIDR range.")
+            return
         self._hosts.clear()
         self._host_listbox.delete(0, "end")
         self._port_table.delete("1.0", "end")
         self._log_text.delete("1.0", "end")
+        self._scan_id = str(uuid.uuid4())
         self._running = True
         self._run_btn.configure(state="disabled")
 
@@ -466,7 +560,7 @@ class DashboardView(ctk.CTkFrame):
                 # Parse host
                 m_host = _HOST_RE.search(line)
                 if m_host:
-                    current_host = m_host.group(1).strip()
+                    current_host = _normalize_host_label(m_host.group(1))
                     self._event_queue.put({"type": "new_host", "host": current_host})
                 # Parse open port
                 m_port = _OPEN_PORT_RE.search(line)
@@ -522,20 +616,29 @@ class DashboardView(ctk.CTkFrame):
             host = event["host"]
             if host not in self._hosts:
                 self._hosts[host] = HostRecord(host)
+                self._hosts[host].scan_id = self._scan_id
                 self._host_listbox.insert("end", f"  {host}")
                 self._update_stats()
+            self._hosts[host].last_seen = datetime.now().isoformat(timespec="seconds")
 
         elif etype == "open_port":
             host = event["host"]
             if host not in self._hosts:
                 self._hosts[host] = HostRecord(host)
+                self._hosts[host].scan_id = self._scan_id
                 self._host_listbox.insert("end", f"  {host}")
             self._hosts[host].ports.append({
                 "port": event["port"],
                 "proto": event["proto"],
+                "state": "open",
                 "service": event["service"],
                 "version": event["version"],
+                "scripts": [],
+                "reason": "",
+                "extrainfo": "",
+                "cpe": [],
             })
+            self._hosts[host].last_seen = datetime.now().isoformat(timespec="seconds")
             self._update_stats()
             if self._current_host == host:
                 self._refresh_port_table(host)
@@ -675,13 +778,13 @@ class DashboardView(ctk.CTkFrame):
             if os_matches:
                 best = os_matches[0]
                 record.os_guess = f"{best['name']} ({best.get('accuracy', '?')}%)"
+            record.hostnames = [str(h) for h in host_data.get("hostnames", []) if h]
 
             # ── Port enrichment ───────────────────────────────────────────────
             # Build a lookup by (port, protocol) from the XML.
             xml_ports: dict[tuple[str, str], dict[str, Any]] = {}
             for p in host_data.get("ports", []):
-                if p.get("state") == "open":
-                    xml_ports[(str(p["port"]), str(p.get("protocol", "tcp")))] = p
+                xml_ports[(str(p["port"]), str(p.get("protocol", "tcp")))] = p
 
             # Update existing port records with richer version data.
             for port_rec in record.ports:
@@ -695,6 +798,11 @@ class DashboardView(ctk.CTkFrame):
                         port_rec["version"] = full_version
                     if xml_p.get("service") and xml_p["service"] != "Unknown":
                         port_rec["service"] = xml_p["service"]
+                    port_rec["state"] = xml_p.get("state", port_rec.get("state", "open"))
+                    port_rec["scripts"] = list(xml_p.get("scripts", []))
+                    port_rec["reason"] = xml_p.get("reason", "")
+                    port_rec["extrainfo"] = xml_p.get("extrainfo", "")
+                    port_rec["cpe"] = [c for c in xml_p.get("cpe", []) if c]
 
             # Add any ports that were in the XML but missed by the text regex
             # (rare but possible for filtered/closed ports shown in XML).
@@ -708,8 +816,13 @@ class DashboardView(ctk.CTkFrame):
                     record.ports.append({
                         "port": port_num,
                         "proto": proto,
+                        "state": xml_p.get("state", "open"),
                         "service": xml_p.get("service", "unknown"),
                         "version": f"{product} {version}".strip(),
+                        "scripts": list(xml_p.get("scripts", [])),
+                        "reason": xml_p.get("reason", ""),
+                        "extrainfo": xml_p.get("extrainfo", ""),
+                        "cpe": [c for c in xml_p.get("cpe", []) if c],
                     })
 
         # Re-render the currently-selected host table with enriched data.
@@ -731,19 +844,51 @@ class DashboardView(ctk.CTkFrame):
         if host not in self._hosts:
             return
         record = self._hosts[host]
-        self._port_table.insert("end", f"HOST: {record.host}   OS: {record.os_guess}\n")
+        hostnames = f" ({', '.join(record.hostnames)})" if record.hostnames else ""
+        self._port_table.insert("end", f"HOST: {record.host}{hostnames}   OS: {record.os_guess}\n")
+        self._port_table.insert(
+            "end",
+            f"SCAN ID: {record.scan_id or 'n/a'}   First Seen: {record.first_seen}   Last Seen: {record.last_seen}\n",
+        )
         self._port_table.insert("end", "─" * 70 + "\n")
-        self._port_table.insert("end", f"{'PORT':<10}{'PROTO':<8}{'SERVICE':<18}{'VERSION'}\n")
+        self._port_table.insert("end", f"{'PORT':<8}{'PROTO':<8}{'STATE':<10}{'SERVICE':<16}{'VERSION'}\n")
         self._port_table.insert("end", "─" * 70 + "\n")
+        advanced = self._show_advanced_var.get()
         for p in record.ports:
             self._port_table.insert(
                 "end",
-                f"{p['port']:<10}{p['proto']:<8}{p['service']:<18}{p['version']}\n",
+                f"{p['port']:<8}{p['proto']:<8}{p.get('state', 'open'):<10}{p['service']:<16}{p['version']}\n",
             )
+            scripts = p.get("scripts", [])
+            if isinstance(scripts, list) and scripts:
+                ids = ", ".join(str(s.get("id", "")) for s in scripts[:3] if isinstance(s, dict) and s.get("id"))
+                if ids:
+                    self._port_table.insert("end", f"   ↳ NSE: {ids}\n")
+                if advanced:
+                    for s in scripts[:2]:
+                        if isinstance(s, dict):
+                            out = str(s.get("output", "")).splitlines()[0][:120]
+                            if out:
+                                self._port_table.insert("end", f"      • {s.get('id', 'script')}: {out}\n")
+            if advanced:
+                if p.get("reason"):
+                    self._port_table.insert("end", f"      reason: {p.get('reason')}\n")
+                if p.get("extrainfo"):
+                    self._port_table.insert("end", f"      extra: {p.get('extrainfo')}\n")
+                cpes = p.get("cpe", [])
+                if isinstance(cpes, list) and cpes:
+                    self._port_table.insert("end", f"      cpe: {', '.join(str(c) for c in cpes[:2])}\n")
 
     def _update_stats(self) -> None:
-        total_ports = sum(len(h.ports) for h in self._hosts.values())
-        services = {p["service"] for h in self._hosts.values() for p in h.ports}
+        total_ports = sum(
+            1 for h in self._hosts.values() for p in h.ports if p.get("state", "open") == "open"
+        )
+        services = {
+            p["service"]
+            for h in self._hosts.values()
+            for p in h.ports
+            if p.get("state", "open") == "open"
+        }
         os_count = sum(1 for h in self._hosts.values() if h.os_guess != "Unknown")
         self._stat_hosts.configure(text=str(len(self._hosts)))
         self._stat_open.configure(text=str(total_ports))
@@ -807,6 +952,7 @@ class DashboardView(ctk.CTkFrame):
         """Public API: select a preset by key. Used by app.py to avoid
         reaching into private widget state."""
         self._preset_var.set(preset_key)
+        self._refresh_ports_gate()
 
     def start_scan(self) -> None:
         """Public API: start a scan with the current target / preset / ports.
@@ -833,15 +979,29 @@ class DashboardView(ctk.CTkFrame):
         self._target_var.set(target)
         self._preset_var.set("(none)")
         self._ports_var.set("")
+        self._refresh_ports_gate()
         self._hosts.clear()
         self._host_listbox.delete(0, "end")
         self._log_text.delete("1.0", "end")
         self._running = True
         self._run_btn.configure(state="disabled")
-        self._command_used = command_str
-        self._log(f"[*] Command Factory → {command_str}\n")
+        # Route command-factory commands through ConflictManager as well.
+        clean_cmd, preflight_msgs = self._log_preflight_warnings(parts)
+        if ConflictManager.has_errors(preflight_msgs):
+            error_texts = [text for sev, text in preflight_msgs if sev == "error"]
+            self._running = False
+            self._run_btn.configure(state="normal")
+            self._status_var.set("Scan blocked — fix errors first.")
+            _error_dialog(
+                self,
+                "Scan Blocked — Error Detected",
+                "\n\n".join(error_texts),
+            )
+            return
+        self._command_used = " ".join(clean_cmd)
+        self._log(f"[*] Command Factory → {self._command_used}\n")
         self._status_var.set("Scanning…")
-        threading.Thread(target=self._scan_worker, args=(parts,), daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=(clean_cmd,), daemon=True).start()
 
     def load_from_smart_scan(
         self, endpoints: list[dict[str, Any]], rate: float
