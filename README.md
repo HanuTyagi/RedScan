@@ -1,4 +1,4 @@
-# RedScan v2 – Network Intelligence Platform
+# RedScan – Network Intelligence Platform
 
 Conference-demo-ready RedScan with a **unified GUI** and a full backend engine.
 
