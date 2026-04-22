@@ -372,10 +372,12 @@ class SmartScanModule:
                         continue  # not our packet
 
                     tcp_resp_flags = tcp_raw[13]
+                    ack_num = struct.unpack("!L", tcp_raw[8:12])[0]
                     rtt_ms = (time.perf_counter() - start) * 1000.0
 
                     # SYN-ACK → open; RST → closed
-                    if tcp_resp_flags & 0x12 == 0x12:   # SYN + ACK
+                    if tcp_resp_flags & 0x12 == 0x12 and ack_num == ((seq_num + 1) & 0xFFFFFFFF):
+                        # ACK check filters unrelated/background packets.
                         return ProbeResult(endpoint=endpoint, status="open", rtt_ms=rtt_ms)
                     if tcp_resp_flags & 0x04:            # RST
                         return ProbeResult(endpoint=endpoint, status="closed", rtt_ms=rtt_ms)
@@ -624,6 +626,15 @@ class SmartScanModule:
                 RuntimeWarning,
                 stacklevel=2,
             )
+        elif calib_test.status == "closed" and self.cfg.calibration_requires_open:
+            import warnings
+            warnings.warn(
+                f"Calibration endpoint {self.cfg.calibration_host}:{self.cfg.calibration_port} "
+                "responded closed (RST).  Configure a known-open calibration port or set "
+                "`calibration_requires_open=False` to permit closed RTT samples.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         elif calib_test.rtt_ms is not None:
             self.controller.calibration_update(calib_test.rtt_ms)
 
@@ -662,8 +673,10 @@ class SmartScanModule:
                     if per_probe_callback is not None:
                         per_probe_callback(result, is_calibration_task)
                     if is_calibration_task:
-                        if result.status in ("open", "closed") and result.rtt_ms is not None:
-                            # Accept RST (closed) replies as valid RTT samples.
+                        accept_closed = not self.cfg.calibration_requires_open
+                        if result.status == "open" and result.rtt_ms is not None:
+                            self.controller.calibration_update(result.rtt_ms)
+                        elif accept_closed and result.status == "closed" and result.rtt_ms is not None:
                             self.controller.calibration_update(result.rtt_ms)
                         elif result.status == "timeout":
                             self.controller.register_timeout()
