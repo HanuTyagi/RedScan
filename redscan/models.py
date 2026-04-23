@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Endpoint(BaseModel):
@@ -25,17 +25,17 @@ class DiscoveryConfig(BaseModel):
     calibration_port: int = 22
     calibration_ratio: int = Field(default=256, ge=1)
     connect_timeout_s: float = Field(default=0.6, gt=0)
-    control_interval_s: float = Field(default=0.5, gt=0)
+    control_interval_s: float = Field(default=1.0, gt=0)
     ewma_alpha: float = Field(default=0.2, gt=0, le=1)
     target_delta_ms: float = Field(default=3.0, ge=0)
-    kp: float = 0.04
-    ki: float = 0.008
-    kd: float = 0.01
+    kp: float = Field(default=0.04, ge=0)
+    ki: float = Field(default=0.008, ge=0)
+    kd: float = Field(default=0.01, ge=0)
     r_min: float = Field(default=10.0, gt=0)
     r_max: float = Field(default=2000.0, gt=0)
     initial_rate: float = Field(default=120.0, gt=0)
-    loss_window_s: float = Field(default=2.0, gt=0)
-    loss_threshold: int = Field(default=20, ge=1)
+    loss_window_s: float = Field(default=10.0, gt=0)
+    loss_threshold: int = Field(default=2, ge=1)
     aimd_beta: float = Field(default=0.5, gt=0, lt=1)
     # Number of calibration samples collected before RTT_base is locked in.
     # Prevents the first (often elevated) sample from setting an artificially
@@ -68,6 +68,19 @@ class DiscoveryConfig(BaseModel):
     # Optional DNS server (e.g. "1.1.1.1") used when resolving hostnames
     # before probing.  None = use the system resolver.
     dns_server: str | None = None
+
+    # Calibration policy: when True, only SYN-ACK/open calibration replies are
+    # accepted as RTT samples (paper-aligned assumption of known-open endpoint).
+    # Set False to also accept RST/closed replies in constrained environments.
+    calibration_requires_open: bool = True
+
+    @model_validator(mode="after")
+    def _validate_rate_bounds(self) -> "DiscoveryConfig":
+        if self.r_min > self.r_max:
+            raise ValueError("r_min must be <= r_max")
+        if not (self.r_min <= self.initial_rate <= self.r_max):
+            raise ValueError("initial_rate must be within [r_min, r_max]")
+        return self
 
 
 class DiscoveryStats(BaseModel):
