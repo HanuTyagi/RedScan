@@ -49,8 +49,8 @@ _DEFAULT_COMMUNITY_PATH = Path.home() / ".redscan_community_presets.json"
 # Keys that must be present in every imported preset JSON object.
 _REQUIRED_KEYS = {"key", "name", "category", "description", "flags", "aggressiveness"}
 
-# Allowed aggressiveness values
-_AGGRESSIVENESS_VALUES = {"low", "medium", "high", "critical", "safe"}
+# Allowed aggressiveness values (must match preset_library.py)
+_AGGRESSIVENESS_VALUES = {"low", "medium", "high", "extreme"}
 
 
 def export_presets(presets: list[ScanPreset], path: Path) -> None:

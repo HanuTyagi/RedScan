@@ -645,7 +645,12 @@ class ConflictManager:
             try:
                 is_root = os.geteuid() == 0
             except AttributeError:
-                is_root = True  # Windows — assume privileged
+                # Windows: check for admin privileges
+                try:
+                    import ctypes
+                    is_root = ctypes.windll.shell32.IsUserAnAdmin() != 0
+                except Exception:
+                    is_root = False
 
         clean_cmd: list[str] = _normalize_command(list(cmd))
         messages: list[_INFO] = []
@@ -690,5 +695,7 @@ class ConflictManager:
         if flags & _NO_PORT_SCAN_FLAGS:
             return False
         if flags & _SELF_PORTING_FLAGS:
+            return False
+        if "-p" in flags:
             return False
         return True

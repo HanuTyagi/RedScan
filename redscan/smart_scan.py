@@ -131,7 +131,7 @@ class AdaptiveRateController:
 class SmartScanModule:
     # Convert rate units into an upper bound for concurrent in-flight probes.
     _CONCURRENCY_SCALING_FACTOR = 4
-    _MIN_INFLIGHT = 25
+    _MIN_INFLIGHT = 200
 
     def __init__(self, cfg: DiscoveryConfig | None = None) -> None:
         self.cfg = cfg or DiscoveryConfig()
@@ -299,7 +299,11 @@ class SmartScanModule:
             seq_num = random.randint(0, 0xFFFFFFFF)
 
             # ── Resolve source IP ──────────────────────────────────────────
-            src_ip = _socket.gethostbyname(_socket.gethostname())
+            try:
+                src_ip = _socket.gethostbyname(_socket.gethostname())
+            except (socket.gaierror, socket.herror, OSError) as exc:
+                # Fallback to a default source IP if hostname resolution fails
+                src_ip = "0.0.0.0"
 
             # ── Build TCP SYN header (20 bytes) ───────────────────────────
             tcp_flags_syn = 0x002
@@ -465,7 +469,8 @@ class SmartScanModule:
         # Optionally boost from history
         history_weights: dict[int, int] = {}
         try:
-            from redscan.history import _history  # type: ignore[attr-defined]
+            from redscan.history import ScanHistoryStore  # type: ignore[attr-defined]
+            _history = ScanHistoryStore()
             for entry in _history.list_entries(limit=50):
                 for p in (entry.open_count,):  # placeholder – real ports not stored
                     pass
@@ -538,9 +543,10 @@ class SmartScanModule:
                     pos += 2
                     if rtype == 1 and rdlen == 4:
                         return _socket.inet_ntoa(resp[pos:pos+4])
-                sock.close()
             except Exception:
                 pass
+            finally:
+                sock.close()
 
         return _socket.gethostbyname(hostname)
 
@@ -550,6 +556,7 @@ class SmartScanModule:
         endpoints: list[Endpoint],
         per_probe_callback: Callable[[ProbeResult, bool], None] | None = None,
         resume: bool = False,
+        is_running: Callable[[], bool] | None = None,
     ) -> DiscoveryOutput:
         """Run the adaptive discovery scan over *endpoints*.
 
@@ -627,29 +634,30 @@ class SmartScanModule:
             endpoints = remaining
 
         # ── Pre-flight: warn if calibration endpoint is unreachable ──────────
-        calib_test = await self._probe(
-            Endpoint(host=self.cfg.calibration_host, port=self.cfg.calibration_port)
-        )
-        if calib_test.status == "timeout" and calib_test.rtt_ms is None:
-            import warnings
-            warnings.warn(
-                f"Calibration endpoint {self.cfg.calibration_host}:{self.cfg.calibration_port} "
-                "is unreachable (timeout).  The rate controller will have no RTT signal; "
-                "the scan rate will remain fixed at initial_rate.",
-                RuntimeWarning,
-                stacklevel=2,
+        if self.cfg.calibration_host:
+            calib_test = await self._probe(
+                Endpoint(host=self.cfg.calibration_host, port=self.cfg.calibration_port)
             )
-        elif calib_test.status == "closed" and self.cfg.calibration_requires_open:
-            import warnings
-            warnings.warn(
-                f"Calibration endpoint {self.cfg.calibration_host}:{self.cfg.calibration_port} "
-                "responded closed (RST).  Configure a known-open calibration port or set "
-                "`calibration_requires_open=False` to permit closed RTT samples.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        elif calib_test.rtt_ms is not None:
-            self.controller.calibration_update(calib_test.rtt_ms)
+            if calib_test.status == "timeout" and calib_test.rtt_ms is None:
+                import warnings
+                warnings.warn(
+                    f"Calibration endpoint {self.cfg.calibration_host}:{self.cfg.calibration_port} "
+                    "is unreachable (timeout).  The rate controller will have no RTT signal; "
+                    "the scan rate will remain fixed at initial_rate.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            elif calib_test.status == "closed" and self.cfg.calibration_requires_open:
+                import warnings
+                warnings.warn(
+                    f"Calibration endpoint {self.cfg.calibration_host}:{self.cfg.calibration_port} "
+                    "responded closed (RST).  Configure a known-open calibration port or set "
+                    "`calibration_requires_open=False` to permit closed RTT samples.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            elif calib_test.rtt_ms is not None:
+                self.controller.calibration_update(calib_test.rtt_ms)
 
         results: list[ProbeResult] = list(prior_results)
         queue = deque(endpoints)
@@ -657,9 +665,25 @@ class SmartScanModule:
         calibration_counter = 0
         last_control = time.monotonic()
         _checkpoint_interval = 50
+        _checkpoint_interval = 50
         _checkpoint_counter = 0
+        accumulated_delay = 0.0
+
+        try:
+            import resource
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft < 10000:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 65535), hard))
+        except Exception:
+            pass
 
         while queue or in_flight:
+            if is_running and not is_running():
+                for task in in_flight:
+                    task.cancel()
+                in_flight.clear()
+                break
+
             while queue and len(in_flight) < max(
                 self._MIN_INFLIGHT,
                 int(self.controller.rate // self._CONCURRENCY_SCALING_FACTOR),
@@ -668,11 +692,17 @@ class SmartScanModule:
                 in_flight[asyncio.create_task(self._probe(endpoint))] = False
                 calibration_counter += 1
 
-                if calibration_counter % self.cfg.calibration_ratio == 0:
+                if self.cfg.calibration_host and calibration_counter % self.cfg.calibration_ratio == 0:
                     calib_ep = Endpoint(host=self.cfg.calibration_host, port=self.cfg.calibration_port)
                     in_flight[asyncio.create_task(self._probe(calib_ep))] = True
 
-                await asyncio.sleep(max(0.0, 1.0 / max(self.controller.rate, 1.0)))
+                expected_delay = 1.0 / max(self.controller.rate, 1.0)
+                accumulated_delay += expected_delay
+                if accumulated_delay >= 0.01:
+                    await asyncio.sleep(accumulated_delay)
+                    accumulated_delay = 0.0
+                elif not queue:
+                    await asyncio.sleep(0)
 
             if in_flight:
                 done, pending = await asyncio.wait(
@@ -695,6 +725,10 @@ class SmartScanModule:
                             self.controller.register_timeout()
                     else:
                         results.append(result)
+                        # Implicit calibration: if calibration_host is not set, use target responses!
+                        if not self.cfg.calibration_host and result.rtt_ms is not None:
+                            if result.status in ("open", "closed"):
+                                self.controller.calibration_update(result.rtt_ms)
                         _checkpoint_counter += 1
                         if checkpoint and _checkpoint_counter % _checkpoint_interval == 0:
                             checkpoint.save([

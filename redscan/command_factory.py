@@ -6,6 +6,23 @@ import networkx as nx
 
 from .models import CommandBuildRequest, CommandBuildResult
 
+def _condense_ports(ports: list[int]) -> str:
+    if not ports:
+        return ""
+    sorted_ports = sorted(set(ports))
+    ranges = []
+    start = sorted_ports[0]
+    end = sorted_ports[0]
+    for p in sorted_ports[1:]:
+        if p == end + 1:
+            end = p
+        else:
+            ranges.append(f"{start}-{end}" if start != end else str(start))
+            start = p
+            end = p
+    ranges.append(f"{start}-{end}" if start != end else str(start))
+    return ",".join(ranges)
+
 
 class CommandFactoryEngine:
     """Node/graph-based command constructor."""
@@ -27,7 +44,7 @@ class CommandFactoryEngine:
 
         ports = sorted(set(request.ports))
         if ports:
-            graph.add_node("ports", args=["-p", ",".join(str(p) for p in ports)])
+            graph.add_node("ports", args=["-p", _condense_ports(ports)])
         else:
             graph.add_node("ports", args=[])
         graph.add_edge("timing", "ports")
