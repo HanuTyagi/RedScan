@@ -79,7 +79,7 @@ def parse_nmap_xml(xml_file):
                 for script in port.findall('script'):
                     scripts.append({
                         "id": script.attrib.get('id'),
-                        "output": script.attrib.get('output')
+                        "output": script.text
                     })
 
                 host_data["ports"].append({

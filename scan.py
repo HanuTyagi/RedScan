@@ -3,6 +3,7 @@ import sys
 import re
 import os
 import ctypes
+import ipaddress
 
 # ==========================================
 # 1. REDSCAN PRESET LIBRARY (NESTED ARCHITECTURE)
@@ -75,7 +76,11 @@ def is_ip_address(target):
     """Checks if the target is an IP or localhost to prevent script errors."""
     if not target: return False
     if target.lower() in ["localhost", "127.0.0.1"]: return True
-    return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$", target))
+    try:
+        ipaddress.ip_address(target.split('/')[0])  # Handle CIDR notation
+        return True
+    except ValueError:
+        return False
 
 def pre_flight_checks(scan_data, target, port_flags, is_root):
     """Linter for Nmap commands to prevent runtime script or syntax errors."""

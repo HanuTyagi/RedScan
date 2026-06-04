@@ -165,8 +165,9 @@ async def run_probe(target, start_port=1, end_port=65535):
     print(f"  Ports {start_port}-{end_port}  |  Initial Concurrency: {INITIAL_CONCURRENCY}")
     print(f"{'='*60}\n")
 
-    # One shared semaphore — limits truly concurrent connections
-    sem = asyncio.Semaphore(INITIAL_CONCURRENCY)
+    # Dynamic semaphore that adjusts based on rate controller
+    # We use a higher initial limit and control actual concurrency via the rate controller
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
     # Background tasks
     ctrl_task = asyncio.create_task(heuristic_controller(state))

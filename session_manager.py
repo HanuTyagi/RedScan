@@ -1,8 +1,14 @@
 import json
 import os
 from datetime import datetime
+from pathlib import Path
+import tempfile
 
-TEMP_SESSION_FILE = "temp_session.json"
+# Temp file paths for session management
+_REDSCAN_DIR = os.path.expanduser("~/.redscan")
+os.makedirs(_REDSCAN_DIR, exist_ok=True)
+TEMP_SESSION_FILE = os.path.join(_REDSCAN_DIR, "redscan_session.json")
+TEMP_XML_FILE = os.path.join(_REDSCAN_DIR, "redscan_temp_scan_results.xml")
 
 def get_current_session():
     """Returns the current session dictionary from the temp file. If none exists, return empty structure."""
@@ -29,6 +35,14 @@ def save_current_session(session_data):
     """Writes the given session dictionary to the temp file."""
     with open(TEMP_SESSION_FILE, 'w') as f:
         json.dump(session_data, f, indent=4)
+
+def clear_current_session():
+    """Deletes the current temp session data to start fresh."""
+    if os.path.exists(TEMP_SESSION_FILE):
+        try:
+            os.remove(TEMP_SESSION_FILE)
+        except OSError:
+            pass
 
 def update_session(target, insights):
     """

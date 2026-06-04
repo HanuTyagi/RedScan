@@ -4,6 +4,7 @@ import scan
 import xml_parser
 import session_manager
 import port_prober
+import tempfile
 
 def main():
     current_target = None
@@ -11,7 +12,10 @@ def main():
 
     # Format the privilege string for the dashboard
     privilege_status = "ROOT / ADMIN" if is_root else "STANDARD USER (Raw socket scans will fail)"
-    temp_xml_file = "temp_scan_results.xml"
+
+    # Use temp directory for temporary files
+    temp_dir = tempfile.gettempdir()
+    temp_xml_file = os.path.join(temp_dir, "redscan_temp_scan_results.xml")
 
     # Cleanup any stale state
     session_manager.clear_temp_files(temp_xml_file)
