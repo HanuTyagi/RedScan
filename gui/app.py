@@ -49,7 +49,7 @@ class RedScanApp(ctk.CTk):
         _build_window_icon(self)
         self._active_view = tk.StringVar(value="presets")
         self._build_layout()
-        self._show_view("presets")
+        self._show_view("dashboard")
         # Ensure any running nmap process is terminated when the window is closed.
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -255,7 +255,11 @@ def _info_dialog(parent: ctk.CTk | ctk.CTkFrame, title: str, message: str) -> No
     dlg = ctk.CTkToplevel(parent)
     dlg.title(title)
     dlg.geometry("400x160")
-    dlg.grab_set()
+    def _apply():
+        try: dlg.transient(parent.winfo_toplevel())
+        except: pass
+        dlg.grab_set()
+    dlg.after(100, _apply)
     ctk.CTkLabel(dlg, text=message, font=FONT_SMALL, wraplength=360, justify="left").pack(
         padx=PAD, pady=PAD
     )

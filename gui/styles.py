@@ -48,9 +48,9 @@ BORDER_W      = 1
 
 # ── Sidebar nav items ────────────────────────────────────────────────────────
 NAV_ITEMS = [
+    ("dashboard",     "📊  Scan Dashboard"),
     ("presets",       "🎯  Preset Library"),
     ("factory",       "🔧  Command Factory"),
-    ("dashboard",     "📊  Scan Dashboard"),
     ("smart_scan",    "⚡  Smart Scan"),
     ("llm",           "🤖  AI Insights"),
 ]
