@@ -298,11 +298,6 @@ class CommandFactoryView(ctk.CTkFrame):
         # Diff view: tokens added/removed by the last load_preset call
         self._diff_added: set[str] = set()
 
-        # Macros: {name: [token1, token2, …]}, persisted to ~/.redscan_macros.json
-        self._macros: dict[str, list[str]] = {}
-        self._macros_path: Path = Path.home() / ".redscan_macros.json"
-        self._load_macros()
-
         self._target_var = tk.StringVar(value="192.168.1.1")
         self._target_var.trace_add("write", lambda *_: self._update_preview())
         self._ports_var = tk.StringVar(value="")
@@ -316,6 +311,7 @@ class CommandFactoryView(ctk.CTkFrame):
     @staticmethod
     def _safe_grab(window: ctk.CTkToplevel) -> None:
         """Best-effort modal grab that avoids 'window not viewable' TclError."""
+        window.update_idletasks()
         def _apply() -> None:
             try:
                 if window.winfo_exists() and window.winfo_viewable():
@@ -323,7 +319,7 @@ class CommandFactoryView(ctk.CTkFrame):
             except tk.TclError:
                 # Non-fatal; leave dialog modeless instead of crashing callback.
                 pass
-        window.after(1, _apply)
+        window.after(50, _apply)
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -560,15 +556,6 @@ class CommandFactoryView(ctk.CTkFrame):
             corner_radius=BTN_CORNER,
             command=self._validate_command,
         ).pack(side="left", padx=(0, PAD_S))
-
-        ctk.CTkButton(
-            btn_row,
-            text="🔗  Macros",
-            fg_color="#2a1a2a",
-            hover_color="#4a2a4a",
-            corner_radius=BTN_CORNER,
-            command=self._show_macros_dialog,
-        ).pack(side="left")
 
         self._refresh_palette()
         self.after(50, self._redraw_canvas)
@@ -883,7 +870,12 @@ class CommandFactoryView(ctk.CTkFrame):
         try:
             is_root = os.geteuid() == 0
         except AttributeError:
-            is_root = True
+            # Windows: check for admin privileges
+            try:
+                import ctypes
+                is_root = ctypes.windll.shell32.IsUserAnAdmin() != 0
+            except Exception:
+                is_root = False
 
         _, messages = ConflictManager(disabled_rules=self._disabled_rules).apply(
             cmd, target, "", is_root
@@ -1425,166 +1417,3 @@ class CommandFactoryView(ctk.CTkFrame):
             self._diff_added = set()
             self._redraw_canvas()
 
-    # ── Macros ───────────────────────────────────────────────────────────────
-
-    def _load_macros(self) -> None:
-        try:
-            if self._macros_path.exists():
-                data = json.loads(self._macros_path.read_text())
-                if isinstance(data, dict):
-                    self._macros = data
-        except Exception:
-            self._macros = {}
-
-    def _save_macros(self) -> None:
-        try:
-            self._macros_path.write_text(json.dumps(self._macros, indent=2))
-        except OSError:
-            pass
-
-    def _show_macros_dialog(self) -> None:
-        """Manage piece groups / macros: save the current canvas as a macro,
-        or merge-load a saved macro onto the canvas."""
-        popup = ctk.CTkToplevel(self)
-        popup.title("Piece Macros")
-        popup.geometry("600x460")
-        self._safe_grab(popup)
-
-        # ── Save current canvas as macro ──────────────────────────────────────
-        save_frame = ctk.CTkFrame(popup, fg_color="#1a2a3a", corner_radius=8)
-        save_frame.pack(fill="x", padx=PAD, pady=(PAD, PAD_S))
-
-        ctk.CTkLabel(
-            save_frame,
-            text="💾  Save current canvas as a macro:",
-            font=("Segoe UI", 11, "bold"),
-            text_color="#aaddff",
-            anchor="w",
-        ).pack(padx=PAD_S, pady=(PAD_S, 0), anchor="w")
-
-        name_row = ctk.CTkFrame(save_frame, fg_color="transparent")
-        name_row.pack(fill="x", padx=PAD_S, pady=PAD_S)
-        name_entry = ctk.CTkEntry(
-            name_row,
-            font=FONT_SMALL,
-            placeholder_text="Macro name, e.g. Web Recon",
-            width=300,
-        )
-        name_entry.pack(side="left", padx=(0, PAD_S))
-
-        def _save_macro() -> None:
-            name = name_entry.get().strip()
-            if not name:
-                return
-            tokens = [fd.first_token for fd in self._placed]
-            if not tokens:
-                return
-            self._macros[name] = tokens
-            self._save_macros()
-            name_entry.delete(0, "end")
-            _refresh_list()
-
-        ctk.CTkButton(
-            name_row,
-            text="Save Macro",
-            width=110,
-            fg_color="#1e4a6e",
-            hover_color="#2a6a9e",
-            corner_radius=6,
-            font=FONT_SMALL,
-            command=_save_macro,
-        ).pack(side="left")
-
-        # ── Saved macros list ─────────────────────────────────────────────────
-        ctk.CTkLabel(
-            popup,
-            text="Saved macros — click ▶ Load to merge-place onto canvas, 🗑 to delete:",
-            font=FONT_SMALL,
-            anchor="w",
-        ).pack(padx=PAD, pady=(0, 0), anchor="w")
-
-        list_frame = ctk.CTkScrollableFrame(popup, fg_color="transparent")
-        list_frame.pack(fill="both", expand=True, padx=PAD, pady=PAD_S)
-
-        def _refresh_list() -> None:
-            for w in list_frame.winfo_children():
-                w.destroy()
-            if not self._macros:
-                ctk.CTkLabel(
-                    list_frame,
-                    text="No macros saved yet.",
-                    font=FONT_SMALL,
-                    text_color=TEXT_MUTED,
-                ).pack(pady=PAD)
-                return
-            for macro_name, tokens in list(self._macros.items()):
-                row = ctk.CTkFrame(list_frame, fg_color="#1a2a3a", corner_radius=6)
-                row.pack(fill="x", pady=2)
-
-                info = ctk.CTkFrame(row, fg_color="transparent")
-                info.pack(side="left", fill="x", expand=True, padx=PAD_S, pady=4)
-                ctk.CTkLabel(
-                    info,
-                    text=macro_name,
-                    font=("Segoe UI", 11, "bold"),
-                    text_color="#aaddff",
-                    anchor="w",
-                ).pack(anchor="w")
-                ctk.CTkLabel(
-                    info,
-                    text="  ".join(tokens[:8]) + ("  …" if len(tokens) > 8 else ""),
-                    font=("Courier New", 9),
-                    text_color="#5588aa",
-                    anchor="w",
-                ).pack(anchor="w")
-
-                ctk.CTkButton(
-                    row,
-                    text="▶ Load",
-                    width=72,
-                    height=28,
-                    font=FONT_SMALL,
-                    fg_color=ACCENT,
-                    hover_color=ACCENT_HOVER,
-                    corner_radius=6,
-                    command=lambda t=tokens: self._merge_macro(t),
-                ).pack(side="right", padx=(0, PAD_S), pady=4)
-
-                def _delete(n: str = macro_name) -> None:
-                    self._macros.pop(n, None)
-                    self._save_macros()
-                    _refresh_list()
-
-                ctk.CTkButton(
-                    row,
-                    text="🗑",
-                    width=36,
-                    height=28,
-                    font=("Segoe UI", 13),
-                    fg_color="#3a1a1a",
-                    hover_color="#5a2a2a",
-                    corner_radius=6,
-                    command=_delete,
-                ).pack(side="right", pady=4)
-
-        _refresh_list()
-        ctk.CTkButton(popup, text="Close", command=popup.destroy).pack(pady=(0, PAD))
-
-    def _merge_macro(self, tokens: list[str]) -> None:
-        """Merge-load a macro by placing any of its pieces that aren't already
-        on the canvas and that aren't blocked by conflict rules."""
-        placed_tokens = {fd.first_token for fd in self._placed}
-        before_tokens = set(placed_tokens)
-        added = False
-        for fd in self._flags_data:
-            if fd.first_token in tokens and fd.first_token not in placed_tokens:
-                self._placed.append(fd)
-                placed_tokens.add(fd.first_token)
-                added = True
-        if added:
-            after_tokens = {fd.first_token for fd in self._placed}
-            self._diff_added = after_tokens - before_tokens
-            self._redraw_canvas()
-            self._refresh_palette()
-            self._update_preview()
-            self.after(2000, self._clear_diff)

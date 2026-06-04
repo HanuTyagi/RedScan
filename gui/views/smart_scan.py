@@ -254,7 +254,7 @@ class SmartScanView(ctk.CTkFrame):
             self._port_custom_container, textvariable=self._port_custom_var, font=FONT_SMALL,
         )
         # Hidden by default (mode starts at "Common")
-        self._add_field(cfg_frame, "Calibration Host:", self._calib_host_var,
+        self._add_field(cfg_frame, "Calibration Host (leave blank to disable):", self._calib_host_var,
             "A reliable always-reachable host used to measure RTT and calibrate the probe "
             "rate.  Use 8.8.8.8 for internet scans or your LAN gateway for internal scans.")
         self._add_field(cfg_frame, "Calibration Port:", self._calib_port_var,
@@ -278,11 +278,11 @@ class SmartScanView(ctk.CTkFrame):
         ctk.CTkLabel(self._adv_frame, text="Rate Controller", font=FONT_H2, anchor="w").pack(
             fill="x", padx=PAD_S)
 
-        self._s_r_min   = _LabeledSlider(self._adv_frame, "R_min (probes/s)",  1,   200,  10, "{:.0f}",
+        self._s_r_min   = _LabeledSlider(self._adv_frame, "R_min (probes/s)",  1,   500,  50, "{:.0f}",
             "Minimum probe rate enforced after AIMD backoffs.  Keep ≥ 5 for reasonable throughput.")
-        self._s_r_max   = _LabeledSlider(self._adv_frame, "R_max (probes/s)", 10, 2000, 500, "{:.0f}",
+        self._s_r_max   = _LabeledSlider(self._adv_frame, "R_max (probes/s)", 10, 20000, 20000, "{:.0f}",
             "Hard cap on probe rate.  Increase for fast LANs; lower for congested links or stealth.")
-        self._s_r_init  = _LabeledSlider(self._adv_frame, "Initial Rate",      1,  500, 120, "{:.0f}",
+        self._s_r_init  = _LabeledSlider(self._adv_frame, "Initial Rate",      1,  20000, 2000, "{:.0f}",
             "Probe rate before the first calibration RTT sample arrives.  100–150 is safe for most networks.")
         self._s_alpha   = _LabeledSlider(self._adv_frame, "EWMA α (smoothing)", 0.01, 0.99, 0.2,
             "Controls how quickly filtered RTT tracks new samples.  Higher = more reactive; lower = smoother.")
@@ -322,9 +322,16 @@ class SmartScanView(ctk.CTkFrame):
         ctk.CTkLabel(self._adv_frame, text="Probe Type:", font=FONT_SMALL, anchor="w").pack(
             fill="x", padx=PAD_S, pady=(PAD_S, 0))
         self._probe_type_var = tk.StringVar(value="tcp_connect")
+        try:
+            is_root_val = os.geteuid() == 0
+        except AttributeError:
+            is_root_val = True
+
+        probe_values = ["tcp_connect", "udp", "icmp", "tcp_syn"] if is_root_val else ["tcp_connect", "udp", "icmp"]
+        
         ctk.CTkSegmentedButton(
             self._adv_frame,
-            values=["tcp_connect", "udp", "icmp", "tcp_syn"],
+            values=probe_values,
             variable=self._probe_type_var,
         ).pack(fill="x", padx=PAD_S, pady=(0, PAD_S))
         ctk.CTkLabel(
@@ -665,8 +672,20 @@ class SmartScanView(ctk.CTkFrame):
         final_rate_box: list[float] = [cfg.initial_rate]
         final_stats_box: list[DiscoveryStats | None] = [None]
 
+        _batch_updates: list[tuple[ProbeResult, bool]] = []
+
+        def _flush_feed() -> None:
+            if not _batch_updates:
+                return
+            batch = _batch_updates[:]
+            _batch_updates.clear()
+            if self.winfo_exists():
+                self._update_live_feed_batch(batch)
+
         def _on_probe(result: ProbeResult, is_calib: bool) -> None:
-            self.after(0, self._update_live_feed, result, is_calib)
+            _batch_updates.append((result, is_calib))
+            if len(_batch_updates) == 1:
+                self.after(50, _flush_feed)
 
         async def _run() -> None:
             if not self._running:
@@ -675,6 +694,7 @@ class SmartScanView(ctk.CTkFrame):
                 endpoints,
                 per_probe_callback=_on_probe,
                 resume=resume,
+                is_running=lambda: self._running,
             )
             total = output.stats.total_count
             total_dropped = output.stats.timeout_count
@@ -724,20 +744,25 @@ class SmartScanView(ctk.CTkFrame):
 
     # ── Live feed ─────────────────────────────────────────────────────────────
 
-    def _update_live_feed(self, result: ProbeResult, is_calib: bool) -> None:
-        ts = time.strftime("%H:%M:%S")
-        ep = result.endpoint
-        status = result.status.upper()
-        rtt = f"  rtt={result.rtt_ms:.1f}ms" if result.rtt_ms else ""
-        kind = "CALIB" if is_calib else status
-        line = f"[{ts}] {kind:<7} {ep.host}:{ep.port}{rtt}\n"
+    def _update_live_feed_batch(self, batch: list[tuple[ProbeResult, bool]]) -> None:
+        if not self.winfo_exists():
+            return
+        lines = []
+        for result, is_calib in batch:
+            ts = time.strftime("%H:%M:%S")
+            ep = result.endpoint
+            status = result.status.upper()
+            rtt = f"  rtt={result.rtt_ms:.1f}ms" if result.rtt_ms else ""
+            kind = "CALIB" if is_calib else status
+            lines.append(f"[{ts}] {kind:<7} {ep.host}:{ep.port}{rtt}\n")
 
-        if self._feed_count >= self._FEED_MAX:
-            # Remove oldest line to keep the feed from growing unbounded
-            self._live_feed.delete("1.0", "2.0")
-        else:
-            self._feed_count += 1
-        self._live_feed.insert("end", line)
+        self._feed_count += len(lines)
+        if self._feed_count > self._FEED_MAX:
+            delete_count = self._feed_count - self._FEED_MAX
+            self._live_feed.delete("1.0", f"{int(delete_count) + 1}.0")
+            self._feed_count = self._FEED_MAX
+
+        self._live_feed.insert("end", "".join(lines))
         self._live_feed.see("end")
 
     # ── UI update helpers ─────────────────────────────────────────────────────
@@ -789,7 +814,11 @@ class SmartScanView(ctk.CTkFrame):
         popup.title("🔍 Smart Scan Complete — Results & Next Steps")
         popup.geometry("920x680")
         popup.resizable(True, True)
-        popup.grab_set()
+        def _apply():
+                try: popup.transient(self.winfo_toplevel())
+                except: pass
+                popup.grab_set()
+        popup.after(100, _apply)
 
         unique_hosts = sorted({r["host"] for r in all_open})
         unique_ports = sorted({int(r["port"]) for r in all_open})

@@ -217,7 +217,11 @@ class PresetCard(ctk.CTkFrame):
         dlg = ctk.CTkToplevel(self)
         dlg.title(f"Script Arguments — {preset.name}")
         dlg.geometry("520x340")
-        dlg.grab_set()
+        def _apply():
+            try: dlg.transient(self.winfo_toplevel())
+            except: pass
+            dlg.grab_set()
+        dlg.after(100, _apply)
 
         ctk.CTkLabel(
             dlg,

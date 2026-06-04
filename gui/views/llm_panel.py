@@ -39,7 +39,7 @@ from gui.styles import (
     PAD, PAD_S, TEXT_MUTED, TEXT_PRIMARY,
 )
 from redscan.ai_history import AIHistoryStore
-from redscan.llm import LLMAnalysisPipeline, LLMProvider, MockLLMProvider
+from redscan.llm import LLMAnalysisPipeline, LLMProvider, MockLLMProvider, TokenCallback
 from redscan.models import Endpoint, LLMAnalysisRequest, LLMAnalysisResult
 
 
@@ -103,11 +103,16 @@ class OpenAIProvider(LLMProvider):
                 stream=True,
             )
             async for chunk in stream:
-                delta = chunk.choices[0].delta.content or ""
-                if delta:
-                    full_text += delta
-                    if on_token is not None:
-                        on_token(delta)
+                try:
+                    if chunk.choices and len(chunk.choices) > 0:
+                        delta = chunk.choices[0].delta.content or ""
+                        if delta:
+                            full_text += delta
+                            if on_token is not None:
+                                on_token(delta)
+                except (AttributeError, IndexError, KeyError):
+                    # Skip malformed chunks
+                    continue
             return _parse_llm_response(full_text, self.name)
         except Exception as exc:
             err = f"[OpenAI streaming error] {exc}"
@@ -168,7 +173,7 @@ class GeminiProvider(LLMProvider):
             )
             # Build conversation history for Gemini chat format.
             gemini_history = [
-                {"role": msg["role"], "parts": [msg["content"]]}
+                {"role": "model" if msg["role"] == "assistant" else msg["role"], "parts": [msg["content"]]}
                 for msg in (history or [])
             ]
             full_text = ""
@@ -387,7 +392,11 @@ class _SettingsDialog(ctk.CTkToplevel):
         self.title("LLM Settings")
         self.geometry("480x560")
         self.resizable(False, False)
-        self.grab_set()
+        def _apply():
+            try: self.transient(parent.winfo_toplevel())
+            except: pass
+            self.grab_set()
+        self.after(100, _apply)
         self._on_apply = on_apply
         self._build()
 
@@ -433,11 +442,22 @@ class _SettingsDialog(ctk.CTkToplevel):
             row=5, column=0, sticky="w", padx=pad
         )
         self._model_var = tk.StringVar(value="")
-        ctk.CTkEntry(
-            self, textvariable=self._model_var,
-            placeholder_text="gpt-4o / gemini-1.5-flash",
+        model_row = ctk.CTkFrame(self, fg_color="transparent")
+        model_row.grid(row=6, column=0, sticky="ew", padx=pad, pady=(0, PAD_S))
+        model_row.columnconfigure(0, weight=1)
+
+        self._model_combo = ctk.CTkComboBox(
+            model_row, variable=self._model_var,
+            values=["gpt-4o", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"],
             font=FONT_SMALL,
-        ).grid(row=6, column=0, sticky="ew", padx=pad, pady=(0, PAD_S))
+        )
+        self._model_combo.grid(row=0, column=0, sticky="ew", padx=(0, PAD_S))
+
+        self._fetch_btn = ctk.CTkButton(
+            model_row, text="Fetch", width=40,
+            command=self._fetch_models,
+        )
+        self._fetch_btn.grid(row=0, column=1)
 
         # Compare provider
         ctk.CTkLabel(self, text="Compare Provider  (for ⚖ Compare mode)", font=FONT_SMALL, anchor="w").grid(
@@ -492,6 +512,26 @@ class _SettingsDialog(ctk.CTkToplevel):
         is_api = self._provider_var.get() != "Mock (offline)"
         self._key_entry.configure(state="normal" if is_api else "disabled")
 
+    def _fetch_models(self) -> None:
+        provider = self._provider_var.get()
+        key = self._key_var.get().strip()
+        if provider != "Gemini" or not key:
+            return
+        self._fetch_btn.configure(state="disabled", text="...")
+        def fetch():
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=key)
+                models = [m.name.replace("models/", "") for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
+                if models:
+                    self.after(0, lambda: self._model_combo.configure(values=models))
+            except Exception:
+                pass
+            finally:
+                self.after(0, lambda: self._fetch_btn.configure(state="normal", text="Fetch"))
+        import threading
+        threading.Thread(target=fetch, daemon=True).start()
+
     def _toggle_key(self) -> None:
         cur = self._key_entry.cget("show")
         self._key_entry.configure(show="" if cur == "•" else "•")
@@ -545,7 +585,11 @@ class _HistoryDialog(ctk.CTkToplevel):
         super().__init__(parent)
         self.title("📜  AI Analysis History")
         self.geometry("700x480")
-        self.grab_set()
+        def _apply():
+            try: self.transient(parent.winfo_toplevel())
+            except: pass
+            self.grab_set()
+        self.after(100, _apply)
         self._store = store
         self._on_load = on_load
         self._build()
@@ -673,7 +717,11 @@ class _CompareDialog(ctk.CTkToplevel):
         super().__init__(parent)
         self.title("⚖  Multi-Provider Comparison")
         self.geometry("1000x540")
-        self.grab_set()
+        def _apply():
+            try: self.transient(parent.winfo_toplevel())
+            except: pass
+            self.grab_set()
+        self.after(100, _apply)
         self._prompt = prompt
         self._history = history
         self._system_prompt = system_prompt

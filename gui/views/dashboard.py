@@ -192,6 +192,17 @@ class DashboardView(ctk.CTkFrame):
         )
         self._preset_combo.pack(side="left", padx=(PAD_S, PAD))
 
+        ctk.CTkLabel(ctrl, text="Timing:", font=FONT_SMALL).pack(side="left")
+        self._timing_var = tk.StringVar(value="-T3")
+        self._timing_combo = ctk.CTkComboBox(
+            ctrl,
+            values=["-T0", "-T1", "-T2", "-T3", "-T4", "-T5"],
+            variable=self._timing_var,
+            width=70,
+            font=FONT_SMALL,
+        )
+        self._timing_combo.pack(side="left", padx=(PAD_S, PAD))
+
         ctk.CTkLabel(ctrl, text="Ports:", font=FONT_SMALL).pack(side="left")
         self._ports_var = tk.StringVar(value="1-1024")
         self._ports_entry = ctk.CTkEntry(ctrl, textvariable=self._ports_var, width=120, font=FONT_SMALL)
@@ -408,14 +419,18 @@ class DashboardView(ctk.CTkFrame):
         preset = get_by_key(preset_key) if preset_key != "(none)" else None
 
         cmd: list[str] = ["nmap"]
+        timing_val = self._timing_var.get()
         if preset:
             cmd.extend(preset.flags)
             if preset.scripts:
                 cmd.extend(["--script", ",".join(preset.scripts)])
             if preset.script_args:
                 cmd.extend(["--script-args", ",".join(preset.script_args)])
+            # Overwrite preset timing if user selected something else, or if preset lacks timing
+            cmd = [f for f in cmd if not f.startswith("-T")]
+            cmd.append(timing_val)
         else:
-            cmd.extend(["-sT", "-sV", "-T4"])
+            cmd.extend(["-sT", "-sV", timing_val])
 
         # Conflict rule: -sn (host-discovery-only) has no port-scan phase.
         # Silently drop the port specification; _log_preflight_warnings() will
@@ -443,10 +458,13 @@ class DashboardView(ctk.CTkFrame):
         preset_key = self._preset_var.get()
         preset = get_by_key(preset_key) if preset_key != "(none)" else None
         cmd: list[str] = ["nmap"]
+        timing_val = self._timing_var.get()
         if preset:
             cmd.extend(preset.flags)
+            cmd = [f for f in cmd if not f.startswith("-T")]
+            cmd.append(timing_val)
         else:
-            cmd.extend(["-sT", "-sV", "-T4"])
+            cmd.extend(["-sT", "-sV", timing_val])
 
         if ConflictManager.needs_ports_input(cmd):
             self._ports_entry.configure(state="normal", text_color=TEXT_PRIMARY)
@@ -513,10 +531,51 @@ class DashboardView(ctk.CTkFrame):
             self._status_var.set("Enter a target IP/hostname before running.")
             _error_dialog(self, "Missing Target", "Please enter a target IP, hostname, or CIDR range.")
             return
-        self._hosts.clear()
-        self._host_listbox.delete(0, "end")
-        self._port_table.delete("1.0", "end")
-        self._log_text.delete("1.0", "end")
+
+        if self._hosts:
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Existing Session")
+            dialog.geometry("450x200")
+            def _apply():
+                try: dialog.transient(self.winfo_toplevel())
+                except: pass
+                dialog.grab_set()
+            dialog.after(100, _apply)
+
+            result = [None]
+            def on_yes(): result[0] = True; dialog.destroy()
+            def on_no(): result[0] = False; dialog.destroy()
+            def on_cancel(): dialog.destroy()
+
+            msg = (
+                "You have an existing session. Do you want to start a NEW session (wiping old results)?\n\n"
+                "Click 'Yes' to start fresh.\n"
+                "Click 'No' to continue and append to the current session."
+            )
+            ctk.CTkLabel(dialog, text=msg, wraplength=400, justify="left").pack(pady=20, padx=20)
+            btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+            btn_frame.pack(pady=10)
+
+            ctk.CTkButton(btn_frame, text="Yes (Start Fresh)", command=on_yes, width=120, fg_color="#e74c3c", hover_color="#c0392b").pack(side="left", padx=5)
+            ctk.CTkButton(btn_frame, text="No (Append)", command=on_no, width=120, fg_color="#2ecc71", hover_color="#27ae60").pack(side="left", padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80, fg_color="transparent", border_width=1).pack(side="left", padx=5)
+
+            self.wait_window(dialog)
+            answer = result[0]
+
+            if answer is None:
+                return
+            elif answer is True: # Start fresh
+                self._hosts.clear()
+                self._host_listbox.delete(0, "end")
+                self._port_table.delete("1.0", "end")
+                self._log_text.delete("1.0", "end")
+        else:
+            self._hosts.clear()
+            self._host_listbox.delete(0, "end")
+            self._port_table.delete("1.0", "end")
+            self._log_text.delete("1.0", "end")
+
         self._scan_id = str(uuid.uuid4())
         self._running = True
         self._run_btn.configure(state="disabled")
@@ -589,6 +648,15 @@ class DashboardView(ctk.CTkFrame):
     def _stop_scan(self) -> None:
         if self._scan_process:
             self._scan_process.terminate()
+            try:
+                # Wait for process to terminate with a timeout
+                self._scan_process.wait(timeout=5)
+            except Exception:
+                # If wait fails, force kill
+                try:
+                    self._scan_process.kill()
+                except Exception:
+                    pass
         # Immediately restore the UI state so the user can start a new scan
         # without waiting for the worker thread's "done" event.
         self._running = False
@@ -627,17 +695,26 @@ class DashboardView(ctk.CTkFrame):
                 self._hosts[host] = HostRecord(host)
                 self._hosts[host].scan_id = self._scan_id
                 self._host_listbox.insert("end", f"  {host}")
-            self._hosts[host].ports.append({
-                "port": event["port"],
-                "proto": event["proto"],
-                "state": "open",
-                "service": event["service"],
-                "version": event["version"],
-                "scripts": [],
-                "reason": "",
-                "extrainfo": "",
-                "cpe": [],
-            })
+            
+            existing_port = next((p for p in self._hosts[host].ports if str(p["port"]) == str(event["port"]) and p["proto"] == event["proto"]), None)
+            if existing_port:
+                existing_port["state"] = "open"
+                if event.get("service"):
+                    existing_port["service"] = event["service"]
+                if event.get("version"):
+                    existing_port["version"] = event["version"]
+            else:
+                self._hosts[host].ports.append({
+                    "port": event["port"],
+                    "proto": event["proto"],
+                    "state": "open",
+                    "service": event["service"],
+                    "version": event["version"],
+                    "scripts": [],
+                    "reason": "",
+                    "extrainfo": "",
+                    "cpe": [],
+                })
             self._hosts[host].last_seen = datetime.now().isoformat(timespec="seconds")
             self._update_stats()
             if self._current_host == host:
@@ -974,15 +1051,58 @@ class DashboardView(ctk.CTkFrame):
             parts = command_str.split()
         if not parts:
             return
-        # Extract target (last non-flag arg)
+            
+        if self._hosts:
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Existing Session")
+            dialog.geometry("450x200")
+            def _apply():
+                try: dialog.transient(self.winfo_toplevel())
+                except: pass
+                dialog.grab_set()
+            dialog.after(100, _apply)
+
+            result = [None]
+            def on_yes(): result[0] = True; dialog.destroy()
+            def on_no(): result[0] = False; dialog.destroy()
+            def on_cancel(): dialog.destroy()
+
+            msg = (
+                "You have an existing session. Do you want to start a NEW session (wiping old results)?\n\n"
+                "Click 'Yes' to start fresh.\n"
+                "Click 'No' to continue and append to the current session."
+            )
+            ctk.CTkLabel(dialog, text=msg, wraplength=400, justify="left").pack(pady=20, padx=20)
+            btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+            btn_frame.pack(pady=10)
+
+            ctk.CTkButton(btn_frame, text="Yes (Start Fresh)", command=on_yes, width=120, fg_color="#e74c3c", hover_color="#c0392b").pack(side="left", padx=5)
+            ctk.CTkButton(btn_frame, text="No (Append)", command=on_no, width=120, fg_color="#2ecc71", hover_color="#27ae60").pack(side="left", padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80, fg_color="transparent", border_width=1).pack(side="left", padx=5)
+
+            self.wait_window(dialog)
+            answer = result[0]
+
+            if answer is None:
+                return
+            elif answer is True: # Start fresh
+                self._hosts.clear()
+                self._host_listbox.delete(0, "end")
+                self._log_text.delete("1.0", "end")
+                self._scan_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            else: # Append
+                self._log_text.insert("end", "\n" + "="*60 + "\n[*] APPENDING NEW SCAN\n" + "="*60 + "\n\n")
+                self._log_text.see("end")
+        else:
+            self._scan_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._log_text.delete("1.0", "end")
+        
         target = parts[-1] if not parts[-1].startswith("-") else "127.0.0.1"
         self._target_var.set(target)
         self._preset_var.set("(none)")
         self._ports_var.set("")
         self._refresh_ports_gate()
-        self._hosts.clear()
-        self._host_listbox.delete(0, "end")
-        self._log_text.delete("1.0", "end")
+        
         self._running = True
         self._run_btn.configure(state="disabled")
         # Route command-factory commands through ConflictManager as well.
@@ -1063,7 +1183,11 @@ def _error_dialog(parent: ctk.CTkFrame, title: str, message: str) -> None:
     dlg = _ctk.CTkToplevel(parent)
     dlg.title(title)
     dlg.geometry("480x200")
-    dlg.grab_set()
+    def _apply():
+        try: dlg.transient(parent.winfo_toplevel())
+        except: pass
+        dlg.grab_set()
+    dlg.after(100, _apply)
     dlg.configure(fg_color="#1a0a0a")
 
     _ctk.CTkLabel(
